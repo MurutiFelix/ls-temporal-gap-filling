@@ -1,0 +1,16 @@
+numpy
+pandas
+scipy
+tqdm
+matplotlib
+netcdf4
+pymannkendall
+rasterio
+fiona
+pyproj
+geopandas
+xarray
+rioxarray
+scikit-learn
+statsmodels
+pyyaml
