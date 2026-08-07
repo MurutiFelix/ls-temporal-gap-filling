@@ -11,6 +11,7 @@ pyproj
 geopandas
 xarray
 rioxarray
+seaborn
 scikit-learn
 statsmodels
 pyyaml

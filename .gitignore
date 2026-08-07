@@ -7,9 +7,11 @@ __pycache__/
 # Local virtual environment
 .venv/
 venv/
+ENV/
 
 # Local Data Storage 
 data/
 
 # IDE configs
 .vscode/
+.idea/
