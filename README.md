@@ -25,12 +25,12 @@ D:\ls-temporal-gap-filling
     ├── train.py                        # Root execution orchestrator (trains RBFN & baselines)
     ├── predict.py                      # Out-of-sample historical gap filler (1995-1999 inference)
     │
-    ├── logs/                           # Automated cluster logs directory (Slurm execution stdout/stderr)
+    ├── logs/                           # Slurm execution stdout/stderr
     │
     ├── data/                           # DATA ENGINEERING & RASTER PROCESSING
     │   ├── dataset.py                  # PyTorch Dataset/DataLoader for RBFN streaming
     │   ├── raster_processor.py         # Resampling, scale standardization (0-1), 3D-to-2D matrix flattening
-    │   └── analyze_and_tune.py         # Validation splitting (18/5 holdout), hyperparam tuning, gap metrics
+    │   └── analyze_tune.py             # Validation splitting (18/5 holdout), hyperparam tuning, gap metrics
     │
     ├── models/                         # MODEL ARCHITECTURES & TRAINING PIPELINES
     │   ├── run_rbfn.sh                 # Slurm HPC script for PyTorch RBFN training
