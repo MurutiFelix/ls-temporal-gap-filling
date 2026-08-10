@@ -1,1 +1,24 @@
 # src/config.yaml
+project:
+  name: "Landsat Temporal Gap Filling"
+  seed: 42
+
+paths:
+  raw_data: "data/raw"
+  static_data: "data/static"
+  processed_data: "data/processed"
+  eda_output: "data/processed/eda"
+  logs: "src/logs"
+
+landsat:
+  bands: ["Red", "Green", "Blue", "NIR", "SWIR", "Thermal"]
+  num_bands: 6
+  training_years: [2000, 2025]
+  gap_years: [1995, 1999]
+
+model:
+  rbfn:
+    num_centers: 50
+    gamma: null 
+    regularization_lambda: 0.001
+    validation_holdout_ratio: 0.22 # ~5 out of 23 months holdout

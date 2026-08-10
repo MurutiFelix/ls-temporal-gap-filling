@@ -10,7 +10,7 @@ venv/
 ENV/
 
 # Local Data Storage 
-data/
+/data/
 
 # IDE configs
 .vscode/

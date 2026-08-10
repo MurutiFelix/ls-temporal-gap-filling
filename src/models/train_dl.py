@@ -1,62 +1,40 @@
-# src/models/rbfn.py
+# src/models/train_dl.py
 """
-Multi-Output Radial Basis Function Network (RBFN) in PyTorch.
-Uses Gaussian kernels for non-linear feature mapping and Ridge regression outputs.
+Deep Learning Training Modules and Loss Tracking for PyTorch Models.
+Encapsulates iterative training, validation passes, and model checkpointing.
 """
 
+from pathlib import Path
+import numpy as np
 import torch
 import torch.nn as nn
-from sklearn.cluster import KMeans
 
 
-class MultiOutputRBFN(nn.Module):
-    """
-    Multi-Output Radial Basis Function Network for multi-band Landsat gap filling.
-    Predicts 6 spectral bands simultaneously (R, G, B, NIR, SWIR, Thermal).
-    """
+class RBFNTrainer:
+    """Manages training loops, closed-form/gradient updates, and checkpointing for RBFN."""
 
-    def __init__(
-        self, in_features: int, num_centers: int, out_bands: int = 6, gamma: float = None
+    def __init__(self, model: nn.Module, config: dict):
+        self.model = model
+        self.config = config
+
+    def fit_ridge(
+        self, X_train: torch.Tensor, Y_train: torch.Tensor, lambda_reg: float = 1e-3
     ):
-        super(MultiOutputRBFN, self).__init__()
-        self.in_features = in_features
-        self.num_centers = num_centers
-        self.out_bands = out_bands
+        """Solves RBFN output weights using closed-form regularized Ridge regression."""
+        self.model.fit_centers(X_train)
+        A = self.model._gaussian_rbf(X_train)
 
-        # Hidden layer centers (c_k)
-        self.centers = nn.Parameter(
-            torch.Tensor(num_centers, in_features), requires_grad=False
-        )
-        self.gamma = gamma
+        I = torch.eye(A.shape[1], device=X_train.device)
+        W = torch.linalg.inv(A.T @ A + lambda_reg * I) @ A.T @ Y_train
 
-        # Output linear weights mapping K centers -> 6 Bands
-        self.linear_weights = nn.Linear(num_centers, out_bands, bias=True)
+        self.model.linear_weights.weight.data = W.T
+        self.model.linear_weights.bias.data.fill_(0.0)
+        print("  ✓ RBFN output weights successfully computed via Ridge solution.")
 
-    def fit_centers(self, X: torch.Tensor):
-        """Initializes RBF centers using K-Means clustering on feature space."""
-        X_np = X.detach().cpu().numpy()
-        kmeans = KMeans(n_clusters=self.num_clusters_count(), random_state=42, n_init=10)
-        kmeans.fit(X_np)
-
-        self.centers.data = torch.tensor(
-            kmeans.cluster_centers_, dtype=torch.float32
-        )
-
-        if self.gamma is None:
-            dists = torch.cdist(self.centers, self.centers)
-            mean_dist = torch.mean(dists)
-            self.gamma = 1.0 / (2.0 * (mean_dist**2) + 1e-8)
-
-    def num_clusters_count(self) -> int:
-        return self.num_centers
-
-    def _gaussian_rbf(self, X: torch.Tensor) -> torch.Tensor:
-        """Computes Gaussian activation: exp(-gamma * ||x - c_k||^2)"""
-        distances = torch.cdist(X, self.centers, p=2)
-        return torch.exp(-self.gamma * (distances**2))
-
-    def forward(self, X: torch.Tensor) -> torch.Tensor:
-        """Forward pass: X -> Gaussian RBF activations -> Linear multi-band outputs."""
-        rbf_activations = self._gaussian_rbf(X)
-        output_bands = self.linear_weights(rbf_activations)
-        return output_bands
+    def evaluate(self, X_val: torch.Tensor, Y_val: torch.Tensor) -> float:
+        """Evaluates validation Loss/RMSE."""
+        self.model.eval()
+        with torch.no_grad():
+            preds = self.model(X_val)
+            rmse = torch.sqrt(torch.mean((preds - Y_val) ** 2)).item()
+        return rmse
