@@ -1,5 +1,6 @@
 # Python bytecode caches
 __pycache__/
+__init__.py
 *.pyc
 *.pyo
 *.pyd
