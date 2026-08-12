@@ -10,30 +10,24 @@ import matplotlib.patches as mpatches
 import pandas as pd
 import seaborn as sns
 
-# -----------------------------------------------------------------------------
 # 1. Path Setup (Relative to Repository Root)
-# -----------------------------------------------------------------------------
-# Determine root directory based on the location of this script
+
 SCRIPT_DIR = Path(__file__).resolve().parent
 ROOT_DIR = SCRIPT_DIR.parent
 
-DATA_PATH = ROOT_DIR / "data" / "Landsat_Monthly_Image_Counts_1995_2010.csv"
+DATA_PATH = ROOT_DIR / "data" / "Landsat_Monthly_Image_Count_20%QC_1995_2010.csv"
 OUTPUT_DIR = ROOT_DIR / "data" / "Processed" / "eda"
 
 # Ensure output directory exists
 OUTPUT_DIR.mkdir(parents=True, exist_ok=True)
 
-# -----------------------------------------------------------------------------
 # 2. Load & Prepare Data
-# -----------------------------------------------------------------------------
 df = pd.read_csv(DATA_PATH)
 
 # Presence flag (1 = Images present, 0 = Missing/Zero)
 df["Has_Images"] = (df["Total_Images"] > 0).astype(int)
 
-# -----------------------------------------------------------------------------
 # 3. Figure 1: Presence Heatmap (With vs. Without Images)
-# -----------------------------------------------------------------------------
 pivot_presence = df.pivot(index="Year", columns="Month", values="Has_Images")
 
 plt.figure(figsize=(11, 7))
@@ -73,9 +67,7 @@ plt.savefig(heatmap_path, dpi=300, bbox_inches="tight")
 plt.close()
 print(f"[✓] Saved presence heatmap to: {heatmap_path}")
 
-# -----------------------------------------------------------------------------
 # 4. Figure 2: Quantitative Counts Heatmap (Zeroes Highlighted)
-# -----------------------------------------------------------------------------
 pivot_counts = df.pivot(index="Year", columns="Month", values="Total_Images")
 
 plt.figure(figsize=(12, 8))
@@ -108,9 +100,7 @@ plt.savefig(counts_heatmap_path, dpi=300, bbox_inches="tight")
 plt.close()
 print(f"[✓] Saved counts heatmap to: {counts_heatmap_path}")
 
-# -----------------------------------------------------------------------------
 # 5. Figure 3: Total Month Summary Breakdown
-# -----------------------------------------------------------------------------
 df["Status"] = df["Total_Images"].apply(
     lambda x: "With Images" if x > 0 else "No Images"
 )
