@@ -13,6 +13,12 @@ var l5Col = ee.ImageCollection('LANDSAT/LT05/C02/T1_L2')
 var l7Col = ee.ImageCollection('LANDSAT/LE07/C02/T1_L2')
   .filterBounds(aoi)
   .filter(ee.Filter.lt('CLOUD_COVER', 20));
+var l8Col = ee.ImageCollection('LANDSAT/LC08/C02/T1_L2') 
+  .filterBounds(aoi) 
+  .filter(ee.Filter.lt('CLOUD_COVER', 20)); 
+var l9Col = ee.ImageCollection('LANDSAT/LC09/C02/T1_L2') 
+  .filterBounds(aoi) 
+  .filter(ee.Filter.lt('CLOUD_COVER', 20));
 
 // Create a list of years and months to iterate over 
 var years = ee.List.sequence(startYear, endYear); 
@@ -51,12 +57,12 @@ var countCollection = ee.FeatureCollection(imageCounts);
 
 
 // 4. DISPLAY IN CONSOLE AND EXPORT TO CSV 
-print('Landsat Monthly Image Counts (1995-2010):', countCollection); 
+print('Landsat Monthly Image Counts (1995-2025):', countCollection); 
 
 // Export the results to your Google Drive as a clean CSV file 
 Export.table.toDrive({ 
   collection: countCollection, 
-  description: 'Landsat_Monthly_Image_Counts_1995_2010', 
+  description: 'Landsat_Monthly_Image_Counts_1995_2025_20CV', 
   fileFormat: 'CSV', 
   selectors: ['Year', 'Month', 'Date_Label', 'Landsat5_Count', 'Landsat7_Count', 'Total_Images'] 
 });
