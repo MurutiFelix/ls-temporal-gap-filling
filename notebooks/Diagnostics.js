@@ -4,7 +4,7 @@ Map.centerObject(aoi, 8);
 Map.addLayer(aoi, {color: 'red'}, 'Study Area'); 
 
 var startYear = 1995; 
-var endYear = 2010; 
+var endYear = 2025; 
 
 // Load Surface Reflectance Tier 1 collections for Landsat 5 and 7 
 var l5Col = ee.ImageCollection('LANDSAT/LT05/C02/T1_L2')

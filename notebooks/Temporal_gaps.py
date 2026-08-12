@@ -15,7 +15,7 @@ import seaborn as sns
 SCRIPT_DIR = Path(__file__).resolve().parent
 ROOT_DIR = SCRIPT_DIR.parent
 
-DATA_PATH = ROOT_DIR / "data" / "Landsat_Monthly_Image_Count_20%QC_1995_2010.csv"
+DATA_PATH = ROOT_DIR / "data" / "Landsat_Monthly_Image_Counts_1995_2025_20CV.csv"
 OUTPUT_DIR = ROOT_DIR / "data" / "Processed" / "eda"
 
 # Ensure output directory exists
