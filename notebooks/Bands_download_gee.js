@@ -1,106 +1,112 @@
-// ===== CONFIG =====
+// CONFIG 
 var startYear = 1995;
-var endYear = 2005;
+var endYear = 2025;
 var cloudThresh = 20;
-
 var bandsOut = ['green', 'blue', 'red', 'nir', 'swir1', 'swir2', 'thermal'];
-
 var l5l7Map = ['SR_B2', 'SR_B1', 'SR_B3', 'SR_B4', 'SR_B5', 'SR_B7', 'ST_B6'];
 var l8l9Map = ['SR_B3', 'SR_B2', 'SR_B4', 'SR_B5', 'SR_B6', 'SR_B7', 'ST_B10'];
 
-// ===== CLOUD MASKING (Collection 2 SR/ST QA_PIXEL) =====
+// CLOUD MASKING 
 function maskL2(image) {
   var qa = image.select('QA_PIXEL');
-  var cloudShadowBitMask = (1 << 3) | (1 << 4); // cloud, cloud shadow
+  var cloudShadowBitMask = (1 << 3) | (1 << 4);
   var mask = qa.bitwiseAnd(cloudShadowBitMask).eq(0);
   var satMask = image.select('QA_RADSAT').eq(0);
   return image.updateMask(mask).updateMask(satMask);
 }
-
-// Collection 2 Level-2 scale factors
 function applyScaleFactors(image) {
   var opticalBands = image.select('SR_B.').multiply(0.0000275).add(-0.2);
   var thermalBands = image.select('ST_B.*').multiply(0.00341802).add(149.0);
   return image.addBands(opticalBands, null, true)
               .addBands(thermalBands, null, true);
 }
-
 function prepImage(image, bandMap) {
   var masked = maskL2(image);
   var scaled = applyScaleFactors(masked);
   return scaled.select(bandMap, bandsOut);
 }
 
-// ===== COLLECTION GETTERS =====
-function getL5(y, m) {
-  return ee.ImageCollection('LANDSAT/LT05/C02/T1_L2')
+// COLLECTION GETTERS 
+function getColl(collId, y, m, bandMap) {
+  return ee.ImageCollection(collId)
     .filterBounds(aoi)
     .filterDate(ee.Date.fromYMD(y, m, 1), ee.Date.fromYMD(y, m, 1).advance(1, 'month'))
     .filter(ee.Filter.lt('CLOUD_COVER', cloudThresh))
-    .map(function(img) { return prepImage(img, l5l7Map); });
+    .map(function(img) { return prepImage(img, bandMap); });
+}
+function getL5(y, m) { return getColl('LANDSAT/LT05/C02/T1_L2', y, m, l5l7Map); }
+function getL7(y, m) { return getColl('LANDSAT/LE07/C02/T1_L2', y, m, l5l7Map); }
+function getL8(y, m) { return getColl('LANDSAT/LC08/C02/T1_L2', y, m, l8l9Map); }
+function getL9(y, m) { return getColl('LANDSAT/LC09/C02/T1_L2', y, m, l8l9Map); }
+
+function getMissionColl(name, y, m) {
+  if (name === 'l5') return getL5(y, m);
+  if (name === 'l7') return getL7(y, m);
+  if (name === 'l8') return getL8(y, m);
+  return getL9(y, m);
 }
 
-function getL7(y, m) {
-  return ee.ImageCollection('LANDSAT/LE07/C02/T1_L2')
-    .filterBounds(aoi)
-    .filterDate(ee.Date.fromYMD(y, m, 1), ee.Date.fromYMD(y, m, 1).advance(1, 'month'))
-    .filter(ee.Filter.lt('CLOUD_COVER', cloudThresh))
-    .map(function(img) { return prepImage(img, l5l7Map); });
+// MISSION PRIORITY LIST BY ERA 
+// Ordered candidates, tried in sequence until one has data.
+function getMissionPriority(y) {
+  if (y <= 1998) return ['l5', 'l7'];
+  if (y <= 2012) return ['l7', 'l5'];
+  if (y === 2013) return ['l8', 'l7'];       // transition year
+  if (y <= 2021) return ['l8', 'l7'];        // L9 doesn't exist yet
+  return ['l9', 'l8', 'l7'];                 // 2022+: L9 primary, L8 fallback
 }
 
-function getL8(y, m) {
-  return ee.ImageCollection('LANDSAT/LC08/C02/T1_L2')
-    .filterBounds(aoi)
-    .filterDate(ee.Date.fromYMD(y, m, 1), ee.Date.fromYMD(y, m, 1).advance(1, 'month'))
-    .filter(ee.Filter.lt('CLOUD_COVER', cloudThresh))
-    .map(function(img) { return prepImage(img, l8l9Map); });
-}
+// BUILD FULL TASK LIST SERVER-SIDE, RESOLVE ONCE 
+var monthKeys = [];
+var sizeQueries = [];
 
-// ===== MISSION SELECTION WITH FAILSAFES =====
-// 1995-98: L5 primary, L7 fallback
-// 1999-2005: L7 primary, L5 fallback (L8 doesn't exist yet pre-2013, so no need to reach for it here)
-function getMonthlyCollection(y, m) {
-  var primary, fallback;
-  if (y <= 1998) {
-    primary = getL5(y, m);
-    fallback = getL7(y, m);
-  } else {
-    primary = getL7(y, m);
-    fallback = getL5(y, m);
-  }
-  return ee.ImageCollection(primary.merge(fallback));
-}
-
-// ===== MAIN EXPORT LOOP =====
 for (var year = startYear; year <= endYear; year++) {
   for (var month = 1; month <= 12; month++) {
-    (function(y, m) {
-      var monthColl = getMonthlyCollection(y, m);
-      var count = monthColl.size();
+    var priority = getMissionPriority(year);
+    var colls = priority.map(function(name) { return getMissionColl(name, year, month); });
 
-      var composite = ee.Image(ee.Algorithms.If(
-        count.gt(0),
-        monthColl.median().clip(aoi),
-        null
-      ));
-
-      var mm = m < 10 ? '0' + m : '' + m;
-
-      bandsOut.forEach(function(bandName) {
-        var img = ee.Image(composite).select([bandName]);
-        var desc = bandName + '_' + y + '_' + mm;
-
-        Export.image.toDrive({
-          image: img,
-          description: desc,
-          folder: 'Datasets1',
-          fileNamePrefix: desc,
-          region: aoi,
-          scale: 30,
-          crs: 'EPSG:21097',
-          maxPixels: 1e13
-        });
-      });
-    })(year, month);
+    monthKeys.push({y: year, m: month, priority: priority});
+    colls.forEach(function(c) { sizeQueries.push(c.size()); });
   }
 }
+
+// ONE round-trip for the whole run instead of one per month
+var allSizes = ee.List(sizeQueries).getInfo();
+
+//  MAIN EXPORT LOOP 
+var sizeIdx = 0;
+monthKeys.forEach(function(entry) {
+  var priority = entry.priority;
+  var sizesForMonth = priority.map(function() { return allSizes[sizeIdx++]; });
+
+  // pick first mission in priority order that actually has data
+  var missionUsed = null;
+  for (var i = 0; i < priority.length; i++) {
+    if (sizesForMonth[i] > 0) { missionUsed = priority[i]; break; }
+  }
+
+  if (!missionUsed) {
+    print('No data for', entry.y, entry.m, '- skipping');
+    return;
+  }
+
+  var coll = getMissionColl(missionUsed, entry.y, entry.m);
+  var composite = coll.median().clip(aoi);
+  var mm = entry.m < 10 ? '0' + entry.m : '' + entry.m;
+
+  bandsOut.forEach(function(bandName) {
+    var img = composite.select([bandName]);
+    var desc = bandName + '_' + entry.y + '_' + mm + '_' + missionUsed;
+
+    Export.image.toDrive({
+      image: img,
+      description: desc,
+      folder: 'Landsat_Bands',
+      fileNamePrefix: desc,
+      region: aoi,
+      scale: 30,
+      crs: 'EPSG:21097',
+      maxPixels: 1e13
+    });
+  });
+});
