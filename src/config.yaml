@@ -4,21 +4,24 @@ project:
   seed: 42
 
 paths:
-  raw_data: "data/raw"
-  static_data: "data/static"
-  processed_data: "data/processed"
-  eda_output: "data/processed/eda"
+  data_dir: "data"
+  landsat_dir: "data/landsat"
+  avhrr_dir: "data/avhrr"
+  modis_dir: "data/modis"
+  static_dir: "data/static"
+  processed_dir: "data/processed"
+  eda_dir: "data/processed/eda"
   logs: "src/logs"
 
 landsat:
-  bands: ["Red", "Green", "Blue", "NIR", "SWIR", "Thermal"]
-  num_bands: 6
+  bands: ["Red", "Green", "Blue", "NIR", "SWIR1", "SWIR2", "Thermal"]
+  num_bands: 7
   training_years: [2000, 2025]
   gap_years: [1995, 1999]
 
 model:
   rbfn:
     num_centers: 50
-    gamma: null 
+    gamma: null
     regularization_lambda: 0.001
-    validation_holdout_ratio: 0.22 # ~5 out of 23 months holdout
+    validation_holdout_ratio: 0.22
