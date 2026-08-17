@@ -18,7 +18,7 @@
 │   ├── static/                         # Landscape invariant -DEM
 │   ├── era5/ 
 │         ├── precip
-│         └── temp/            # Landscape invariant -DEM
+│         └── temp/            #
 │   └── processed/                      # Output matrix cache, predicted GeoTIFFs, reports
 │         └── eda/                      # Exploratory visual plots, heatmaps, summary metrics
 │
