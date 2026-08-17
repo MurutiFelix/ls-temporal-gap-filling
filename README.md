@@ -6,14 +6,16 @@
 
 
 ```
-D:\ls-temporal-gap-filling
+\ls-temporal-gap-filling
 ├── .gitignore
 ├── README.md
 ├── requirements.txt
 │
 ├── data/                              # ALL EXPERIMENT DATA MODALITIES
-│   ├── raw/                            # Unprocessed Landsat, MODIS, AVHRR (.tif/.csv), ERA5
-│   ├── static/                         # Landscape invariants (DEM, Elevation, Aspect, Distance to Water)
+│   ├── landsat/                        # Unprocessed Landsat bands (R,G,B,NIR,SWIR1,SWIR2,Thermal)
+│   ├── avhrr/                          # avhrr ndvi for missing years
+│   ├── modis/                          # modis ndvi/ modis bands
+│   ├── static/                         # Landscape invariants (DEM, Soil)
 │   └── processed/                      # Output matrix cache, predicted GeoTIFFs, reports
 │       └── eda/                        # Exploratory visual plots, heatmaps, summary metrics
 │
@@ -39,7 +41,7 @@ D:\ls-temporal-gap-filling
     │    
     └── utils/                          # UTILITIES & GEOSPATIAL HELPERS
         ├── spatial.py                  # Spatial windowing, coordinate encoding, spatial weight matrices
-        └── metrics.py                  # Downstream spectral index solvers (VHI, BSI, SMI) & RMSE/SSIM
+        └── metrics.py*                  # Downstream spectral index solvers (VHI, BSI, SMI) & RMSE/SSIM
 
 ```
-The required bands/Target bands are Red, Green, Blue, NIR, SWIR and Thermal 
+The required bands/Target bands are Red, Green, Blue, NIR, SWIR(1&2) and Thermal 
