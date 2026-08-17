@@ -13,6 +13,7 @@ def compute_spectral_indices(predicted_cube: np.ndarray) -> dict:
     Shape: (N_samples, 7) or (Height, Width, 7)
     """
     red = predicted_cube[..., 0]
+    blue = predicted_cube[..., 2]
     nir = predicted_cube[..., 3]
     swir1 = predicted_cube[..., 4]
     thermal = predicted_cube[..., 6]
@@ -20,8 +21,8 @@ def compute_spectral_indices(predicted_cube: np.ndarray) -> dict:
     # Normalized Difference Vegetation Index
     ndvi = (nir - red) / (nir + red + 1e-6)
 
-    # Bare Soil Index
-    bsi = ((swir1 + red) - (nir + red)) / ((swir1 + red) + (nir + red) + 1e-6)
+    # Bare Soil Index — matches finalized formula: [(SWIR1+R)-(NIR+B)] / [(SWIR1+R)+(NIR+B)]
+    bsi = ((swir1 + red) - (nir + blue)) / ((swir1 + red) + (nir + blue) + 1e-6)
 
     # Vegetation Health Index Proxy
     vhi = (ndvi + (1.0 - thermal)) / 2.0

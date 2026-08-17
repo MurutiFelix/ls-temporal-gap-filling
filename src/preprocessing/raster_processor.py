@@ -1,4 +1,4 @@
-# src/data/raster_processor.py
+# src/preprocessing/raster_processor.py
 """
 Geospatial Raster Processor for Landsat, MODIS/AVHRR, and ERA5 Modalities.
 Handles raster alignment, scale standardization (0-1), and 3D-to-2D matrix flattening.

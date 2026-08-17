@@ -1,17 +1,14 @@
-# src/data/analyze_tune.py
+# src/preprocessing/dataset.py
 """
-Validation Splitting, Hyperparameter Tuning, and Gap Analysis Engine.
-Handles spatial/temporal holdout splits and optimizes RBFN hyperparameters (K centers, lambda).
+PyTorch Dataset/DataLoader for RBFN streaming, plus temporal train/val splitting.
 """
 
-from typing import Dict, Tuple
+from typing import Tuple
 import numpy as np
-import torch
-from sklearn.model_selection import KFold
 
 
-class HyperparameterTuner:
-    """Tunes RBFN parameters (num_centers, lambda) using cross-validation."""
+class GapFillDataset:
+    """Handles temporal splitting and will house the PyTorch Dataset/DataLoader for RBFN streaming."""
 
     def __init__(self, config: dict):
         self.config = config
@@ -28,25 +25,4 @@ class HyperparameterTuner:
 
         return X_train, X_val, Y_train, Y_val
 
-    def grid_search_rbfn(
-        self,
-        X_train: torch.Tensor,
-        Y_train: torch.Tensor,
-        center_candidates: list = [30, 50, 100],
-        lambda_candidates: list = [1e-4, 1e-3, 1e-2],
-    ) -> Dict[str, float]:
-        """Evaluates hyperparameter combinations to minimize validation error."""
-        best_rmse = float("inf")
-        best_params = {}
-
-        # Implementation of search loop over candidates
-        for k in center_candidates:
-            for reg in lambda_candidates:
-                # Simulates score check
-                score = np.random.uniform(0.01, 0.05)
-                if score < best_rmse:
-                    best_rmse = score
-                    best_params = {"num_centers": k, "regularization_lambda": reg}
-
-        print(f"  ✓ Optimal Hyperparameters Found: {best_params}")
-        return best_params
+    # TODO: add PyTorch Dataset/__getitem__/__len__ + DataLoader construction here

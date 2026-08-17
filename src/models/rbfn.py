@@ -12,14 +12,14 @@ import torch.nn as nn
 class MultiOutputRBFN(nn.Module):
     """
     Multi-Output Radial Basis Function Network for multi-band Landsat gap filling.
-    Predicts 6 spectral bands simultaneously (Red, Green, Blue, NIR, SWIR, Thermal).
+    Predicts 7 spectral bands simultaneously (Red, Green, Blue, NIR, SWIR1, SWIR2, Thermal).
     """
 
     def __init__(
         self,
         in_features: int,
         num_centers: int,
-        out_bands: int = 6,
+        out_bands: int = 7,
         gamma: float = None,
     ):
         super(MultiOutputRBFN, self).__init__()
@@ -33,7 +33,7 @@ class MultiOutputRBFN(nn.Module):
         )
         self.gamma = gamma
 
-        # Output linear weights mapping K centers -> 6 Bands
+        # Output linear weights mapping K centers -> 7 Bands
         self.linear_weights = nn.Linear(num_centers, out_bands, bias=True)
 
     def fit_centers(self, X: torch.Tensor):

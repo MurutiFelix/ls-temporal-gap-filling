@@ -9,9 +9,9 @@ import numpy as np
 import torch
 import yaml
 
-from src.data.raster_processor import RasterProcessor
+from src.preprocessing.raster_processor import RasterProcessor
+from src.preprocessing.indices import compute_spectral_indices
 from src.models.rbfn import MultiOutputRBFN
-from src.utils.metrics import compute_spectral_indices
 
 SRC_DIR = Path(__file__).resolve().parent
 ROOT_DIR = SRC_DIR.parent
@@ -27,7 +27,7 @@ def main():
 
     checkpoint_path = (
         ROOT_DIR
-        / config["paths"]["processed_data"]
+        / config["paths"]["processed_dir"]
         / "models"
         / "rbfn_landsat_gap_filler.pt"
     )
