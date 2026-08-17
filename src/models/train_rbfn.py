@@ -1,4 +1,4 @@
-# src/models/train_dl.py
+# src/models/train_rbfn.py
 """
 Deep Learning Training Modules and Loss Tracking for PyTorch Models.
 Encapsulates iterative training, validation passes, and model checkpointing.
