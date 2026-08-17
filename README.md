@@ -15,9 +15,12 @@
 │   ├── landsat/                        # Unprocessed Landsat bands (R,G,B,NIR,SWIR1,SWIR2,Thermal)
 │   ├── avhrr/                          # avhrr ndvi for missing years
 │   ├── modis/                          # modis ndvi/ modis bands
-│   ├── static/                         # Landscape invariants (DEM, Soil)
+│   ├── static/                         # Landscape invariant -DEM
+│   ├── era5/ 
+│         ├── precip
+│         └── temp/            # Landscape invariant -DEM
 │   └── processed/                      # Output matrix cache, predicted GeoTIFFs, reports
-│       └── eda/                        # Exploratory visual plots, heatmaps, summary metrics
+│         └── eda/                      # Exploratory visual plots, heatmaps, summary metrics
 │
 ├── notebooks/                          # STRICTLY EDA & EXPLORATORY VISUALIZATIONS
 │   ├── temporal_gaps.py                # Visual gap analysis, heatmaps, missingness breakdown
