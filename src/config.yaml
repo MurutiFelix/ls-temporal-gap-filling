@@ -9,6 +9,8 @@ paths:
   avhrr_dir: "data/avhrr"
   modis_dir: "data/modis"
   static_dir: "data/static"
+  era5_precip_dir: "data/era5/precip"
+  era5_temp_dir: "data/era5/temp"
   processed_dir: "data/processed"
   eda_dir: "data/processed/eda"
   logs: "src/logs"
@@ -18,6 +20,14 @@ landsat:
   num_bands: 7
   training_years: [2000, 2025]
   gap_years: [1995, 1999]
+
+features:
+  # RBFN input predictors - must be available for BOTH training months
+  # (Landsat present) and gap months (Landsat absent)
+  inputs: ["dem", "month_sin", "month_cos", "year_trend", "coord_x", "coord_y", "era5_precip", "era5_temp"]
+  # NOT inputs - evaluation/correlation only, since these aren't available
+  # for training months (avhrr) or weren't chosen as predictors (modis)
+  evaluation_only: ["avhrr_ndvi", "modis_ndvi"]
 
 model:
   rbfn:
