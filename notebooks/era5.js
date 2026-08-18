@@ -34,7 +34,7 @@ for (var year = startYear; year <= endYear; year++) {
       Export.image.toDrive({
         image: precip,
         description: precipDesc,
-        folder: 'Datasets1',
+        folder: 'era5precip',
         fileNamePrefix: precipDesc,
         region: aoi,
         scale: 30, // resampled to match your Landsat 30m grid on export
@@ -53,7 +53,7 @@ for (var year = startYear; year <= endYear; year++) {
       Export.image.toDrive({
         image: temp,
         description: tempDesc,
-        folder: 'Datasets1',
+        folder: 'era5temp',
         fileNamePrefix: tempDesc,
         region: aoi,
         scale: 30,
