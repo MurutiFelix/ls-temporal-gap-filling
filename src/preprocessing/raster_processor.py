@@ -1,15 +1,15 @@
 # src/preprocessing/raster_processor.py
 """
 Geospatial Raster Processor for Landsat, AVHRR/MODIS, ERA5, and static modalities.
-Handles raster loading, alignment to 30m Landsat grid, scale standardization (0-1),
+Handles raster loading, alignment to 30m Landsat grid, feature standardization,
 and 3D-to-2D matrix flattening.
 """
 
 from pathlib import Path
-import re
 import numpy as np
 import rasterio
 from rasterio.enums import Resampling
+from sklearn.preprocessing import StandardScaler
 
 
 class RasterProcessor:
@@ -19,6 +19,8 @@ class RasterProcessor:
         self.config = config
         self.num_bands = config["landsat"]["num_bands"]
         self.root_dir = Path(__file__).resolve().parents[2]  # repo root
+        self.scaler = StandardScaler()
+        self._scaler_fitted = False
 
     def normalize_reflectance(self, arr: np.ndarray) -> np.ndarray:
         """Scales optical reflectance strictly between 0.0 and 1.0."""
@@ -65,15 +67,12 @@ class RasterProcessor:
         """Loads all 7 Landsat bands for a given month, stacked as (H, W, 7). None if any missing."""
         bands = self.config["landsat"]["bands"]
         arrays = []
-        ref_shape = None
 
         for band in bands:
             path = self.find_landsat_file(band, year, month)
             if path is None:
                 return None  # month has no Landsat coverage - a gap month
             arr = self._read_tif(path)
-            if ref_shape is None:
-                ref_shape = arr.shape
             arrays.append(arr)
 
         return np.stack(arrays, axis=-1)
@@ -102,6 +101,30 @@ class RasterProcessor:
             return None
         return self._read_and_resample(path, target_shape)
 
+    def get_pixel_coords(self, target_shape: tuple) -> np.ndarray:
+        """
+        Generates normalized (x, y) pixel-grid coordinate features, (H, W, 2), range 0-1.
+        NOTE: this is relative pixel position within the AOI, not true geographic
+        coordinates. Swap for src.utils.spatial.generate_spatial_coordinates(shape, bounds)
+        if genuine UTM/lat-lon coordinates are preferred as model inputs.
+        """
+        h, w = target_shape
+        xs = np.linspace(0.0, 1.0, w)
+        ys = np.linspace(0.0, 1.0, h)
+        grid_x, grid_y = np.meshgrid(xs, ys)
+        return np.stack([grid_x, grid_y], axis=-1)
+
+    def fit_scaler(self, X_raw: np.ndarray):
+        """Fits StandardScaler on training X only — call once, before transform_features."""
+        self.scaler.fit(X_raw)
+        self._scaler_fitted = True
+
+    def transform_features(self, X_raw: np.ndarray) -> np.ndarray:
+        """Standardizes X using the scaler fitted on training data. Raises if not fitted."""
+        if not self._scaler_fitted:
+            raise RuntimeError("Call fit_scaler() on training data before transform_features().")
+        return self.scaler.transform(X_raw)
+
     def assemble_feature_matrix(
         self,
         coarse_bands: np.ndarray,
@@ -109,13 +132,12 @@ class RasterProcessor:
         static_norms: np.ndarray,
     ) -> np.ndarray:
         """
-        Flattens spatial dimensions and concatenates predictor arrays into matrix X.
-        Shape: (N_samples, N_features)
+        Legacy helper: flattens spatial dimensions and concatenates predictor arrays.
+        Superseded in train.py/predict.py by explicit per-source concatenation
+        (dem + coords + time + era5), kept here for backward compatibility.
         """
         n_samples = coarse_bands.shape[0]
-
         f_coarse = coarse_bands.reshape(n_samples, -1)
         f_climate = climate_data.reshape(n_samples, -1)
         f_norms = static_norms.reshape(n_samples, -1)
-
         return np.hstack([f_coarse, f_climate, f_norms])
