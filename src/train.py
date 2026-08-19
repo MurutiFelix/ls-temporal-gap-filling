@@ -1,14 +1,16 @@
 # src/train.py
 """
 Root Execution Orchestrator.
-Loads real Landsat/ERA5/DEM data, trains RBFN on months with Landsat coverage,
-holds out a temporal validation split, and saves the model checkpoint.
+Loads real Landsat/ERA5/DEM/coordinate data, standardizes features, trains RBFN
+on months with Landsat coverage, holds out a temporal validation split, and
+saves the model checkpoint + fitted feature scaler.
 """
 
 from pathlib import Path
 import numpy as np
 import torch
 import yaml
+import joblib
 
 from src.models.rbfn import MultiOutputRBFN
 from src.models.train_rbfn import RBFNTrainer
@@ -24,7 +26,7 @@ def build_time_features(year: int, month: int) -> np.ndarray:
     """Cyclical month encoding + linear year trend, per features.inputs in config."""
     month_sin = np.sin(2 * np.pi * month / 12.0)
     month_cos = np.cos(2 * np.pi * month / 12.0)
-    year_trend = year  # normalized later alongside other features
+    year_trend = year  # standardized later alongside other features
     return np.array([month_sin, month_cos, year_trend], dtype=np.float32)
 
 
@@ -54,16 +56,17 @@ def main():
                 continue  # need ERA5 present too, since it's a required input
 
             dem_cube = processor.load_static(target_shape)
+            coord_cube = processor.get_pixel_coords(target_shape)
 
             h, w = target_shape
             time_feat = build_time_features(year, month)
             time_grid = np.tile(time_feat, (h, w, 1))
 
-            # Flatten all pixels for this month into rows
             n_pixels = h * w
             X_month = np.concatenate(
                 [
                     dem_cube.reshape(n_pixels, -1),
+                    coord_cube.reshape(n_pixels, -1),
                     time_grid.reshape(n_pixels, -1),
                     era5_cube.reshape(n_pixels, -1),
                 ],
@@ -87,14 +90,20 @@ def main():
     # Normalize reflectance targets to 0-1
     Y_raw = processor.normalize_reflectance(Y_raw)
 
+    # Standardize predictors — critical since DEM (meters), Kelvin temp, mm precip,
+    # and cyclical time features (-1 to 1) are on wildly different scales, and the
+    # RBFN's Gaussian kernel relies on Euclidean distance between them.
+    processor.fit_scaler(X_raw)
+    X_scaled = processor.transform_features(X_raw)
+
     # Temporal holdout split (~22% validation, per config)
     val_ratio = config["model"]["rbfn"]["validation_holdout_ratio"]
-    n_samples = X_raw.shape[0]
+    n_samples = X_scaled.shape[0]
     split_idx = int(n_samples * (1.0 - val_ratio))
 
-    X_train_t = torch.tensor(X_raw[:split_idx], dtype=torch.float32)
+    X_train_t = torch.tensor(X_scaled[:split_idx], dtype=torch.float32)
     Y_train_t = torch.tensor(Y_raw[:split_idx], dtype=torch.float32)
-    X_val_t = torch.tensor(X_raw[split_idx:], dtype=torch.float32)
+    X_val_t = torch.tensor(X_scaled[split_idx:], dtype=torch.float32)
     Y_val_t = torch.tensor(Y_raw[split_idx:], dtype=torch.float32)
 
     model = MultiOutputRBFN(
@@ -113,11 +122,27 @@ def main():
     val_rmse = trainer.evaluate(X_val_t, Y_val_t)
     print(f"  ✓ Validation Overall RMSE: {val_rmse:.5f}")
 
+    # Per-band RMSE breakdown
+    with torch.no_grad():
+        val_preds = model(X_val_t).numpy()
+    per_band_rmse = compute_rmse(Y_val_t.numpy(), val_preds)
+    band_names = config["landsat"]["bands"]
+    for name, rmse in zip(band_names, per_band_rmse):
+        print(f"    {name}: RMSE={rmse:.5f}")
+
     checkpoint_dir = ROOT_DIR / config["paths"]["processed_dir"] / "models"
     checkpoint_dir.mkdir(parents=True, exist_ok=True)
+
     model_path = checkpoint_dir / "rbfn_landsat_gap_filler.pt"
     torch.save(model.state_dict(), model_path)
+
+    # Persist the fitted scaler - predict.py must reuse this exact scaler,
+    # not fit a new one, or gap-month inputs won't match training distribution.
+    scaler_path = checkpoint_dir / "feature_scaler.joblib"
+    joblib.dump(processor.scaler, scaler_path)
+
     print(f"  ✓ Model Checkpoint saved: {model_path}")
+    print(f"  ✓ Feature scaler saved: {scaler_path}")
 
 
 if __name__ == "__main__":
