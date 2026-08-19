@@ -17,8 +17,8 @@
 │   ├── modis/                          # modis ndvi/ modis bands
 │   ├── static/                         # Landscape invariant -DEM
 │   ├── era5/ 
-│         ├── precip
-│         └── temp/            #
+│   │     ├── precip
+│   │     └── temp/            
 │   └── processed/                      # Output matrix cache, predicted GeoTIFFs, reports
 │         └── eda/                      # Exploratory visual plots, heatmaps, summary metrics
 │

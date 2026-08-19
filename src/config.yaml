@@ -35,3 +35,4 @@ model:
     gamma: null
     regularization_lambda: 0.001
     validation_holdout_ratio: 0.22
+    pixels_per_month: 50000  

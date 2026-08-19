@@ -1,9 +1,9 @@
 # src/train.py
 """
 Root Execution Orchestrator.
-Loads real Landsat/ERA5/DEM/coordinate data, standardizes features, trains RBFN
-on months with Landsat coverage, holds out a temporal validation split, and
-saves the model checkpoint + fitted feature scaler.
+Loads real Landsat/ERA5/DEM/coordinate data, subsamples pixels per month to
+bound memory usage, standardizes features, trains RBFN on months with Landsat
+coverage, holds out a temporal validation split, and saves the checkpoint + scaler.
 """
 
 from pathlib import Path
@@ -26,8 +26,17 @@ def build_time_features(year: int, month: int) -> np.ndarray:
     """Cyclical month encoding + linear year trend, per features.inputs in config."""
     month_sin = np.sin(2 * np.pi * month / 12.0)
     month_cos = np.cos(2 * np.pi * month / 12.0)
-    year_trend = year  # standardized later alongside other features
+    year_trend = year
     return np.array([month_sin, month_cos, year_trend], dtype=np.float32)
+
+
+def subsample_pixels(X_month: np.ndarray, Y_month: np.ndarray, n_pixels: int, rng: np.random.Generator):
+    """Randomly subsamples n_pixels rows from a month's data, without replacement."""
+    total = X_month.shape[0]
+    if total <= n_pixels:
+        return X_month, Y_month  # month already smaller than the cap
+    idx = rng.choice(total, size=n_pixels, replace=False)
+    return X_month[idx], Y_month[idx]
 
 
 def main():
@@ -38,11 +47,15 @@ def main():
 
     processor = RasterProcessor(config)
     training_start, training_end = config["landsat"]["training_years"]
+    pixels_per_month = config["model"]["rbfn"].get("pixels_per_month", 8000)
+    rng = np.random.default_rng(config["project"]["seed"])
 
     X_rows = []
     Y_rows = []
 
     print(f"[Train Pipeline] Scanning {training_start}-{training_end} for Landsat-covered months...")
+    print(f"[Train Pipeline] Subsampling up to {pixels_per_month} pixels/month to bound memory.")
+
     for year in range(training_start, training_end + 1):
         for month in range(1, 13):
             landsat_cube = processor.load_landsat_month(year, month)
@@ -74,6 +87,11 @@ def main():
             )
             Y_month = landsat_cube.reshape(n_pixels, -1)
 
+            # Subsample before appending, so X_rows/Y_rows never accumulate
+            # more than pixels_per_month rows per month - this is what bounds
+            # total memory across a long multi-year/decade training range.
+            X_month, Y_month = subsample_pixels(X_month, Y_month, pixels_per_month, rng)
+
             X_rows.append(X_month)
             Y_rows.append(Y_month)
 
@@ -87,16 +105,11 @@ def main():
     Y_raw = np.vstack(Y_rows)
     print(f"  ✓ Assembled training matrix: X={X_raw.shape}, Y={Y_raw.shape}")
 
-    # Normalize reflectance targets to 0-1
     Y_raw = processor.normalize_reflectance(Y_raw)
 
-    # Standardize predictors — critical since DEM (meters), Kelvin temp, mm precip,
-    # and cyclical time features (-1 to 1) are on wildly different scales, and the
-    # RBFN's Gaussian kernel relies on Euclidean distance between them.
     processor.fit_scaler(X_raw)
     X_scaled = processor.transform_features(X_raw)
 
-    # Temporal holdout split (~22% validation, per config)
     val_ratio = config["model"]["rbfn"]["validation_holdout_ratio"]
     n_samples = X_scaled.shape[0]
     split_idx = int(n_samples * (1.0 - val_ratio))
@@ -122,7 +135,6 @@ def main():
     val_rmse = trainer.evaluate(X_val_t, Y_val_t)
     print(f"  ✓ Validation Overall RMSE: {val_rmse:.5f}")
 
-    # Per-band RMSE breakdown
     with torch.no_grad():
         val_preds = model(X_val_t).numpy()
     per_band_rmse = compute_rmse(Y_val_t.numpy(), val_preds)
@@ -136,8 +148,6 @@ def main():
     model_path = checkpoint_dir / "rbfn_landsat_gap_filler.pt"
     torch.save(model.state_dict(), model_path)
 
-    # Persist the fitted scaler - predict.py must reuse this exact scaler,
-    # not fit a new one, or gap-month inputs won't match training distribution.
     scaler_path = checkpoint_dir / "feature_scaler.joblib"
     joblib.dump(processor.scaler, scaler_path)
 
