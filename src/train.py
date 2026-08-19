@@ -1,9 +1,10 @@
 # src/train.py
 """
-Root Execution Orchestrator.
-Loads real Landsat/ERA5/DEM/coordinate data, subsamples pixels per month to
-bound memory usage, standardizes features, trains RBFN on months with Landsat
-coverage, holds out a temporal validation split, and saves the checkpoint + scaler.
+RBFN Gap-Fill Pipeline — Root Execution Orchestrator.
+Loads real Landsat/ERA5/DEM/coordinate data, drops cloud-masked/nodata pixels,
+subsamples pixels per month to bound memory usage, standardizes features,
+trains RBFN on months with Landsat coverage, holds out a temporal validation
+split, and saves the checkpoint + scaler.
 """
 
 from pathlib import Path
@@ -30,6 +31,12 @@ def build_time_features(year: int, month: int) -> np.ndarray:
     return np.array([month_sin, month_cos, year_trend], dtype=np.float32)
 
 
+def drop_invalid_rows(X_month: np.ndarray, Y_month: np.ndarray):
+    """Drops any pixel row where X or Y contains NaN or Inf values."""
+    valid_mask = np.isfinite(X_month).all(axis=1) & np.isfinite(Y_month).all(axis=1)
+    return X_month[valid_mask], Y_month[valid_mask]
+
+
 def subsample_pixels(X_month: np.ndarray, Y_month: np.ndarray, n_pixels: int, rng: np.random.Generator):
     """Randomly subsamples n_pixels rows from a month's data, without replacement."""
     total = X_month.shape[0]
@@ -43,15 +50,24 @@ def main():
     with open(CONFIG_PATH, "r") as f:
         config = yaml.safe_load(f)
 
+    print("=" * 60)
+    print("  RBFN Gap-Fill Pipeline")
+    print("=" * 60)
     print(f"[Train Pipeline] Project: {config['project']['name']}")
 
     processor = RasterProcessor(config)
     training_start, training_end = config["landsat"]["training_years"]
-    pixels_per_month = config["model"]["rbfn"].get("pixels_per_month", 8000)
+    pixels_per_month = config["model"]["rbfn"].get("pixels_per_month", 50000)
     rng = np.random.default_rng(config["project"]["seed"])
 
     X_rows = []
     Y_rows = []
+
+    total_pixels_seen = 0
+    total_pixels_after_clean = 0
+    total_pixels_kept = 0
+    months_used = 0
+    months_fully_masked = 0
 
     print(f"[Train Pipeline] Scanning {training_start}-{training_end} for Landsat-covered months...")
     print(f"[Train Pipeline] Subsampling up to {pixels_per_month} pixels/month to bound memory.")
@@ -87,22 +103,36 @@ def main():
             )
             Y_month = landsat_cube.reshape(n_pixels, -1)
 
-            # Subsample before appending, so X_rows/Y_rows never accumulate
-            # more than pixels_per_month rows per month - this is what bounds
-            # total memory across a long multi-year/decade training range.
+            total_pixels_seen += n_pixels
+
+            # Drop cloud-masked/nodata/Inf pixels before KMeans or scaling touches data
+            X_month, Y_month = drop_invalid_rows(X_month, Y_month)
+            total_pixels_after_clean += X_month.shape[0]
+
+            if X_month.shape[0] == 0:
+                months_fully_masked += 1
+                continue  # entire month was masked out
+
             X_month, Y_month = subsample_pixels(X_month, Y_month, pixels_per_month, rng)
+            total_pixels_kept += X_month.shape[0]
+            months_used += 1
 
             X_rows.append(X_month)
             Y_rows.append(Y_month)
 
     if not X_rows:
         raise RuntimeError(
-            "No training months found with both Landsat and ERA5 coverage. "
+            "No usable training months found (Landsat + ERA5 coverage, non-fully-masked). "
             "Check data/landsat and data/era5 directories."
         )
 
     X_raw = np.vstack(X_rows)
     Y_raw = np.vstack(Y_rows)
+
+    print(f"  ✓ Months used: {months_used} | fully cloud-masked: {months_fully_masked}")
+    print(f"  ✓ Pixels seen: {total_pixels_seen:,} | after NaN/Inf drop: {total_pixels_after_clean:,} "
+          f"({100 * total_pixels_after_clean / max(total_pixels_seen, 1):.1f}% valid)")
+    print(f"  ✓ Pixels kept after subsampling: {total_pixels_kept:,}")
     print(f"  ✓ Assembled training matrix: X={X_raw.shape}, Y={Y_raw.shape}")
 
     Y_raw = processor.normalize_reflectance(Y_raw)
