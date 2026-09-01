@@ -12,7 +12,7 @@
 ├── requirements.txt
 │
 ├── data/                              # ALL EXPERIMENT DATA MODALITIES
-│   ├── landsat/                        # Unprocessed Landsat bands (R,G,B,NIR,SWIR1,SWIR2,Thermal)
+│   ├── landsat/                        # Unprocessed Landsat data (R,G,B,NIR,SWIR1,SWIR2,Thermal layers)
 │   ├── avhrr/                          # avhrr ndvi for missing years
 │   ├── modis/                          # modis ndvi/ modis bands
 │   ├── static/                         # Landscape invariant -DEM
