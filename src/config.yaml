@@ -1,4 +1,5 @@
 # src/config.yaml
+
 project:
   name: "Landsat Temporal Gap Filling"
   seed: 42
@@ -14,20 +15,63 @@ paths:
   processed_dir: "data/processed"
   eda_dir: "data/processed/eda"
   logs: "src/logs"
+  outputs_dir: "outputs"
+  gapfilled_dir: "outputs/gapfilled"
+  evaluation_dir: "outputs/evaluation"
 
 landsat:
   bands: ["Red", "Green", "Blue", "NIR", "SWIR1", "SWIR2", "Thermal"]
   num_bands: 7
+  data_years: [1995, 2025]
   training_years: [2000, 2025]
   gap_years: [1995, 1999]
 
 features:
-  # RBFN input predictors - must be available for BOTH training months
-  # (Landsat present) and gap months (Landsat absent)
-  inputs: ["dem", "month_sin", "month_cos", "year_trend", "coord_x", "coord_y", "era5_precip", "era5_temp"]
-  # NOT inputs - evaluation/correlation only, since these aren't available
-  # for training months (avhrr) or weren't chosen as predictors (modis)
+  # Predictors forming the context-aware input vector X_t.
+  # Landsat_prev and Landsat_next provide the observed temporal context
+  # surrounding the target month, while dt_prev and dt_next encode the
+  # temporal distance from those observations.
+  inputs:
+    - "landsat_prev"
+    - "landsat_next"
+    - "dt_prev"
+    - "dt_next"
+    - "dem"
+    - "coord_x"
+    - "coord_y"
+    - "month_sin"
+    - "month_cos"
+    - "year_trend"
+    - "era5_precip"
+    - "era5_temp"
+
+  # These datasets are not model predictors. They are used only as
+  # independent reference data for evaluating reconstructed NDVI.
   evaluation_only: ["avhrr_ndvi", "modis_ndvi"]
+
+temporal_features:
+  month_cyclic:
+    enabled: true
+    period: 12
+
+  year_trend:
+    enabled: true
+    normalization: "training_period"
+
+  temporal_context:
+    enabled: true
+    previous_frame: "landsat_prev"
+    next_frame: "landsat_next"
+    previous_delta: "dt_prev"
+    next_delta: "dt_next"
+    max_search_months: 12
+
+preprocessing:
+  feature_scaling: "standard"
+  target_scaling: "standard"
+  fit_scalers_on_training_only: true
+  spatial_alignment: true
+  temporal_alignment: true
 
 model:
   rbfn:
@@ -35,4 +79,41 @@ model:
     gamma: null
     regularization_lambda: 0.001
     validation_holdout_ratio: 0.22
-    pixels_per_month: 50000  
+    pixels_per_month: 50000
+    random_state: 42
+
+training:
+  target_mode: "per_band"
+  use_gap_period: false
+  prevent_gap_leakage: true
+  require_temporal_context: true
+
+gap_filling:
+  reconstruct_all_bands: true
+  derive_ndvi_after_reconstruction: true
+  use_temporal_context: true
+
+evaluation:
+  enabled: true
+
+  # AVHRR is available only during the Landsat gap period and is therefore
+  # reserved for independent evaluation rather than training.
+  avhrr:
+    enabled: true
+    variable: "avhrr_ndvi"
+
+  modis:
+    enabled: true
+    variable: "modis_ndvi"
+
+  metrics: ["pearson_r", "spearman_r", "rmse", "mae"]
+
+provenance:
+  enabled: true
+  observation_flag: true
+
+eda:
+  enabled: true
+  correlation_analysis: true
+  temporal_analysis: true
+  spatial_analysis: true

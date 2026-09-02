@@ -1,48 +1,178 @@
 # src/utils/spatial.py
+
 """
-Spatial Helper Utilities.
-Provides spatial windowing, coordinate encoding, and spatial weight matrices for raster grids.
+Spatial utilities for Landsat temporal gap filling.
+
+Provides reusable spatial distance and weighting operations for the
+RBFN pipeline. Target-grid construction and pixel-coordinate generation
+remain under RasterProcessor and DatasetBuilder respectively.
 """
 
-from typing import Tuple
+from typing import Optional, Tuple
+
 import numpy as np
 
 
-def extract_spatial_windows(
-    raster_array: np.ndarray, window_size: int = 3
-) -> np.ndarray:
-    """Extracts sliding spatial N x N patch windows across a 2D spatial grid."""
-    height, width = raster_array.shape[:2]
-    half_w = window_size // 2
+def validate_spatial_shape(
+    array: np.ndarray,
+    expected_shape: Tuple[int, int],
+) -> None:
+    """Validate that a raster or raster cube matches the target grid."""
+    if array.ndim < 2:
+        raise ValueError(
+            f"Expected an array with at least two spatial dimensions, "
+            f"received shape {array.shape}."
+        )
 
-    padded = np.pad(
-        raster_array,
-        ((half_w, half_w), (half_w, half_w), (0, 0)),
-        mode="reflect",
+    actual_shape = array.shape[:2]
+
+    if actual_shape != expected_shape:
+        raise ValueError(
+            f"Spatial shape mismatch: expected {expected_shape}, "
+            f"received {actual_shape}."
+        )
+
+
+def spatial_distance(
+    coordinates: np.ndarray,
+    reference: np.ndarray,
+) -> np.ndarray:
+    """
+    Compute Euclidean spatial distance from each coordinate to a reference.
+
+    Args:
+        coordinates:
+            Array of shape (N, 2).
+
+        reference:
+            Coordinate of shape (2,).
+
+    Returns:
+        One-dimensional array of distances with shape (N,).
+    """
+    coordinates = np.asarray(
+        coordinates,
+        dtype=np.float32,
     )
-    patches = []
 
-    for i in range(half_w, height + half_w):
-        for j in range(half_w, width + half_w):
-            patch = padded[
-                i - half_w : i + half_w + 1, j - half_w : j + half_w + 1
-            ]
-            patches.append(patch.flatten())
+    reference = np.asarray(
+        reference,
+        dtype=np.float32,
+    )
 
-    return np.array(patches)
+    if coordinates.ndim != 2 or coordinates.shape[1] != 2:
+        raise ValueError(
+            "coordinates must have shape (N, 2)."
+        )
+
+    if reference.shape != (2,):
+        raise ValueError(
+            "reference must have shape (2,)."
+        )
+
+    differences = coordinates - reference
+
+    return np.sqrt(
+        np.sum(
+            differences ** 2,
+            axis=1,
+        )
+    )
 
 
-def generate_spatial_coordinates(
-    shape: Tuple[int, int], bounds: Tuple[float, float, float, float]
+def gaussian_spatial_weights(
+    distances: np.ndarray,
+    bandwidth: float,
 ) -> np.ndarray:
-    """Generates normalized (x, y) spatial coordinate features for every pixel in a grid."""
-    min_x, min_y, max_x, max_y = bounds
-    rows, cols = shape
+    """
+    Compute Gaussian spatial weights from distances.
 
-    xs = np.linspace(min_x, max_x, cols)
-    ys = np.linspace(min_y, max_y, rows)
+    The weighting function is:
 
-    grid_x, grid_y = np.meshgrid(xs, ys)
-    coords = np.stack([grid_x.flatten(), grid_y.flatten()], axis=1)
+        w(d) = exp(-d² / (2σ²))
 
-    return coords
+    where σ is the spatial bandwidth.
+    """
+    if bandwidth <= 0:
+        raise ValueError(
+            "bandwidth must be greater than zero."
+        )
+
+    distances = np.asarray(
+        distances,
+        dtype=np.float32,
+    )
+
+    return np.exp(
+        -(
+            distances ** 2
+        )
+        / (
+            2.0 * bandwidth ** 2
+        )
+    ).astype(
+        np.float32,
+        copy=False,
+    )
+
+
+def normalize_coordinates(
+    coordinates: np.ndarray,
+    minimum: Optional[np.ndarray] = None,
+    maximum: Optional[np.ndarray] = None,
+) -> np.ndarray:
+    """
+    Normalize coordinate features independently to approximately [-1, 1].
+    """
+    coordinates = np.asarray(
+        coordinates,
+        dtype=np.float32,
+    )
+
+    if coordinates.ndim != 2 or coordinates.shape[1] != 2:
+        raise ValueError(
+            "coordinates must have shape (N, 2)."
+        )
+
+    if minimum is None:
+        minimum = np.min(
+            coordinates,
+            axis=0,
+        )
+
+    if maximum is None:
+        maximum = np.max(
+            coordinates,
+            axis=0,
+        )
+
+    minimum = np.asarray(
+        minimum,
+        dtype=np.float32,
+    )
+
+    maximum = np.asarray(
+        maximum,
+        dtype=np.float32,
+    )
+
+    span = maximum - minimum
+
+    if np.any(span <= 0):
+        raise ValueError(
+            "Coordinate ranges must be greater than zero."
+        )
+
+    normalized = (
+        2.0
+        * (
+            coordinates - minimum
+        )
+        / span
+        - 1.0
+    )
+
+    return normalized.astype(
+        np.float32,
+        copy=False,
+    )
