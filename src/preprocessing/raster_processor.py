@@ -1,3 +1,5 @@
+from __future__ import annotations
+
 # src/preprocessing/raster_processor.py
 """
 Central raster discovery, loading, and spatial alignment utilities.
@@ -49,8 +51,6 @@ Model Band 6: Thermal
 Expected Landsat filename pattern:
 landsat_YYYY_MM_lX.tif
 """
-
-from __future__ import annotations
 
 from pathlib import Path
 from typing import Any, Dict, List, Optional, Tuple, Union
