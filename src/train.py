@@ -89,8 +89,8 @@ def validate_project_contract(
     """
     Validate the configuration values required by the RBFN training pipeline.
     """
-    landsat_config = config.get("landsat", {})
-    bands = landsat_config.get("bands", [])
+    landsat_config = config.get("landsat") or {}
+    bands = landsat_config.get("bands") or []
 
     if tuple(bands) != EXPECTED_LANDSAT_BANDS:
         raise ValueError(
@@ -107,8 +107,8 @@ def validate_project_contract(
             f"Found: {configured_num_bands}"
         )
 
-    features = config.get("features", {})
-    inputs = features.get("inputs", [])
+    features = config.get("features") or {}
+    inputs = features.get("inputs") or []
 
     if tuple(inputs) != EXPECTED_INPUT_FEATURES:
         raise ValueError(
@@ -263,7 +263,8 @@ def get_training_configuration(
     config: Dict[str, Any],
 ) -> Dict[str, Any]:
     """Extract and validate RBFN training parameters from configuration."""
-    rbfn_config = config.get("model", {}).get("rbfn", {})
+    model_config = config.get("model") or {}
+    rbfn_config = model_config.get("rbfn") or {}
 
     batch_size = int(
         rbfn_config.get(
@@ -401,9 +402,10 @@ def save_training_outputs(
     test_metrics: Dict[str, float],
 ) -> None:
     """Save the trained model, scalers, and reproducibility metadata."""
+    paths_config = config.get("paths") or {}
     processed_dir = (
         ROOT_DIR
-        / config["paths"]["processed_dir"]
+        / paths_config.get("processed_dir", "data/processed")
     )
 
     checkpoint_dir = processed_dir / "models"
