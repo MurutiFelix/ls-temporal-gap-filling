@@ -1,16 +1,21 @@
-
 // =========================================================================
 // MULTI-TILE, MULTI-MISSION LANDSAT MOSAIC — STACKED 7-BAND EXPORT
-// Single batched size check 
+// v5: float32 cast, explicit nodata bake-in, single combined priority score
+//     (L5 > L7 whenever both present, era-correct otherwise), raster-mask
+//     coverage diagnostic (cheap, logged not export-blocking), chunked
+//     getInfo() evaluation to avoid timeout, correct aoi.geometry() usage
 // =========================================================================
 
-// CONFIG
-var startYear = 1995;
+var startYear = 2022;
 var endYear = 2025;
 var bandsOut = ['blue', 'green', 'red', 'nir', 'swir1', 'swir2', 'thermal'];
 
 var l5l7Map = ['SR_B1', 'SR_B2', 'SR_B3', 'SR_B4', 'SR_B5', 'SR_B7', 'ST_B6'];
 var l8l9Map = ['SR_B2', 'SR_B3', 'SR_B4', 'SR_B5', 'SR_B6', 'SR_B7', 'ST_B10'];
+
+// .area()/.intersection() require ee.Geometry, not Feature/FeatureCollection.
+// filterBounds()/clip() accept aoi directly and don't need this.
+var aoiGeometry = aoi.geometry ? aoi.geometry() : aoi;
 
 // CLOUD, SHADOW, AND SATURATION MASKING
 function maskL2(image) {
@@ -28,94 +33,176 @@ function applyScaleFactors(image) {
               .addBands(thermalBands, null, true);
 }
 
-function prepImage(image, bandMap, rank, missionTag) {
+// rank: lower number = higher intended priority. Combined into a single
+// score with CLOUD_COVER so one sort() call is sufficient and unambiguous.
+function prepImage(image, bandMap, missionTag, rank) {
   var masked = maskL2(image);
   var scaled = applyScaleFactors(masked);
+
+  var cloudCover = ee.Number(image.get('CLOUD_COVER'));
+  var priorityScore = ee.Number(rank).multiply(1000).add(cloudCover);
+
   return scaled.select(bandMap, bandsOut)
-    .set('sensor_rank', rank)
     .set('mission', missionTag)
+    .set('sensor_rank', rank)
+    .set('priority_score', priorityScore)
     .copyProperties(image, ['CLOUD_COVER', 'system:time_start']);
 }
 
-// COLLECTION GETTERS (Strict Calendar Month)
-function getColl(collId, y, m, bandMap, rank, missionTag) {
+function getColl(collId, y, m, bandMap, missionTag, rank) {
   var startDate = ee.Date.fromYMD(y, m, 1);
   var endDate = startDate.advance(1, 'month');
 
   return ee.ImageCollection(collId)
     .filterBounds(aoi)
     .filterDate(startDate, endDate)
-    .map(function(img) { return prepImage(img, bandMap, rank, missionTag); });
+    .map(function(img) { return prepImage(img, bandMap, missionTag, rank); });
 }
 
-function getL5(y, m) { return getColl('LANDSAT/LT05/C02/T1_L2', y, m, l5l7Map, 2, 'l5'); }
-function getL7(y, m) { return getColl('LANDSAT/LE07/C02/T1_L2', y, m, l5l7Map, 1, 'l7'); }
-function getL8(y, m) { return getColl('LANDSAT/LC08/C02/T1_L2', y, m, l8l9Map, 3, 'l8'); }
-function getL9(y, m) { return getColl('LANDSAT/LC09/C02/T1_L2', y, m, l8l9Map, 3, 'l9'); }
+// rank is passed explicitly at the call site per era — never a fixed
+// property of the sensor itself.
+function getL5(y, m, rank) { return getColl('LANDSAT/LT05/C02/T1_L2', y, m, l5l7Map, 'l5', rank); }
+function getL7(y, m, rank) { return getColl('LANDSAT/LE07/C02/T1_L2', y, m, l5l7Map, 'l7', rank); }
+function getL8(y, m, rank) { return getColl('LANDSAT/LC08/C02/T1_L2', y, m, l8l9Map, 'l8', rank); }
+function getL9(y, m, rank) { return getColl('LANDSAT/LC09/C02/T1_L2', y, m, l8l9Map, 'l9', rank); }
 
+// Era-based mission availability + priority. L5 always outranks L7 whenever
+// both are queried in the same window (rank 1 vs rank 2).
 function getMonthlyCollection(y, m) {
-  var collections;
+  var parts;
   var primaryTag;
 
   if (y <= 1998) {
-    collections = [getL5(y, m)];
+    // L7 not yet launched (1999) — L5 only.
+    parts = [getL5(y, m, 1)];
     primaryTag = 'l5';
-  } else if (y <= 2003) {
-    collections = [getL7(y, m), getL5(y, m)];
-    primaryTag = 'l7';
   } else if (y <= 2012) {
-    collections = [getL5(y, m), getL7(y, m)];
+    // Both L5 and L7 available. L5 prioritized per request.
+    parts = [getL5(y, m, 1), getL7(y, m, 2)];
     primaryTag = 'l5';
   } else if (y <= 2021) {
-    collections = [getL8(y, m), getL7(y, m)];
+    // L5 decommissioned (2013) — L8 primary, L7 fallback for sidelap/gap fill.
+    parts = [getL8(y, m, 1), getL7(y, m, 2)];
     primaryTag = 'l8';
   } else {
-    collections = [getL9(y, m), getL8(y, m), getL7(y, m)];
+    // L9 primary, L8 and L7 as fallbacks.
+    parts = [getL9(y, m, 1), getL8(y, m, 2), getL7(y, m, 3)];
     primaryTag = 'l9';
   }
 
-  var merged = ee.ImageCollection(collections[0]);
-  for (var i = 1; i < collections.length; i++) {
-    merged = merged.merge(collections[i]);
+  var merged = parts[0];
+  for (var i = 1; i < parts.length; i++) {
+    merged = merged.merge(parts[i]);
   }
+
   return {coll: merged, primaryTag: primaryTag};
 }
 
-// PRE-COMPUTE ALL COLLECTION SIZES IN ONE SERVER ROUND-TRIP
+// Cheap raster-mask coverage diagnostic: fraction of AOI pixels that are
+// valid (unmasked) in this month's mosaic, sampled at coarse scale via
+// reduceRegion instead of exact vector polygon intersection. bestEffort
+// lets EE degrade resolution automatically rather than hard-failing.
+function estimateCoverage(coll) {
+  return ee.Number(
+    coll.mosaic()
+      .select(0)
+      .mask()
+      .reduceRegion({
+        reducer: ee.Reducer.mean(),
+        geometry: aoiGeometry,
+        scale: 500,
+        maxPixels: 1e9,
+        bestEffort: true
+      })
+      .values()
+      .get(0)
+  );
+}
+
+// BUILD FULL TASK LIST (client-side, cheap — no server evaluation yet)
 var taskList = [];
-var sizeQueries = [];
 for (var year = startYear; year <= endYear; year++) {
   for (var month = 1; month <= 12; month++) {
     var res = getMonthlyCollection(year, month);
-    taskList.push({y: year, m: month, coll: res.coll, primaryTag: res.primaryTag});
-    sizeQueries.push(res.coll.size());
+    taskList.push({
+      y: year,
+      m: month,
+      coll: res.coll,
+      primaryTag: res.primaryTag,
+      sizeQuery: res.coll.size(),
+      coverageQuery: estimateCoverage(res.coll)
+    });
   }
 }
-var counts = ee.List(sizeQueries).getInfo(); // single blocking call for the whole run
 
-// EXPORT LOOP — pure client-side after this point, no more server round-trips
+// EVALUATE SIZE + COVERAGE IN YEARLY CHUNKS (12 months at a time) instead
+// of one 360-item getInfo() call, to avoid computation timeout / memory
+// limit errors on the combined server-side graph.
+var counts = [];
+var coverageFractions = [];
+
+for (var y2 = startYear; y2 <= endYear; y2++) {
+  var yearTasks = taskList.filter(function(t) { return t.y === y2; });
+
+  var yearSizeQueries = yearTasks.map(function(t) { return t.sizeQuery; });
+  var yearCoverageQueries = yearTasks.map(function(t) { return t.coverageQuery; });
+
+  var yearCounts = ee.List(yearSizeQueries).getInfo();
+  var yearCoverage = ee.List(yearCoverageQueries).getInfo();
+
+  counts = counts.concat(yearCounts);
+  coverageFractions = coverageFractions.concat(yearCoverage);
+
+  print('Evaluated year ' + y2 + ' (' + yearTasks.length + ' months)');
+}
+
+// EXPORT LOOP
 taskList.forEach(function(entry, index) {
   var count = counts[index];
+  var coverage = coverageFractions[index];
+
   if (count === 0) {
     print('Skipping ' + entry.y + '-' + entry.m + ': no scenes found.');
     return;
   }
 
-  var sorted = entry.coll.sort('CLOUD_COVER', false).sort('sensor_rank', true);
-  var composite = sorted.mosaic().clip(aoi);
+  // Coverage is logged, not export-blocking — partial-coverage months are
+  // retained on purpose; the RBFN gap-fills missing pixels using temporal
+  // neighbors. -9999 nodata marks exactly which pixels those are.
+  var coverageLabel = (coverage === null) ? 'n/a' : coverage.toFixed(2);
+  print('Exporting ' + entry.y + '-' + entry.m +
+        ' (AOI coverage: ' + coverageLabel + ')');
+
+  // Single combined-score sort. mosaic() gives priority last-to-first, so
+  // the WORST score must sort first and the BEST (lowest) score last.
+  var sorted = entry.coll.sort('priority_score', false);
+
+  var composite = sorted.mosaic()
+    .clip(aoi)
+    .select(bandsOut)
+    .unmask(-9999)   // bake explicit nodata into masked/off-footprint pixels
+    .toFloat();       // halves file size vs float64, matches physical precision needed
 
   var mm = entry.m < 10 ? '0' + entry.m : '' + entry.m;
   var desc = 'landsat_' + entry.y + '_' + mm + '_' + entry.primaryTag;
 
   Export.image.toDrive({
-    image: composite.select(bandsOut),
+    image: composite,
     description: desc,
     folder: 'Landsat_Bands',
     fileNamePrefix: desc,
     region: aoi,
     scale: 30,
     crs: 'EPSG:21097',
-    maxPixels: 1e13
+    maxPixels: 1e13,
+    fileFormat: 'GeoTIFF',
+    formatOptions: {
+      cloudOptimized: true,
+      noData: -9999
+    }
   });
 });
-print('Successfully queued monthly mosaic tasks!');
+
+print('Queued monthly mosaic exports: float32, explicit nodata, ' +
+      'L5>L7 priority, single combined mosaic score, ' +
+      'coverage estimated via raster mask + chunked evaluation.');
