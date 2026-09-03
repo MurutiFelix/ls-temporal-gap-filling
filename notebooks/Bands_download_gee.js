@@ -1,12 +1,12 @@
 // =========================================================================
 // MULTI-TILE, MULTI-MISSION LANDSAT MOSAIC — STACKED 7-BAND EXPORT
-// v5: float32 cast, explicit nodata bake-in, single combined priority score
+// v6: float32 cast, explicit nodata bake-in, single combined priority score
 //     (L5 > L7 whenever both present, era-correct otherwise), raster-mask
-//     coverage diagnostic (cheap, logged not export-blocking), chunked
+//     coverage diagnostic guarded against empty collections, chunked
 //     getInfo() evaluation to avoid timeout, correct aoi.geometry() usage
 // =========================================================================
 
-var startYear = 2022;
+var startYear = 1995;
 var endYear = 2025;
 var bandsOut = ['blue', 'green', 'red', 'nir', 'swir1', 'swir2', 'thermal'];
 
@@ -100,22 +100,30 @@ function getMonthlyCollection(y, m) {
 
 // Cheap raster-mask coverage diagnostic: fraction of AOI pixels that are
 // valid (unmasked) in this month's mosaic, sampled at coarse scale via
-// reduceRegion instead of exact vector polygon intersection. bestEffort
-// lets EE degrade resolution automatically rather than hard-failing.
+// reduceRegion instead of exact vector polygon intersection. Guarded
+// against empty collections, which otherwise produce a zero-band mosaic
+// and crash .select() with "Invalid band number (0)".
 function estimateCoverage(coll) {
+  var hasImages = coll.size().gt(0);
+
   return ee.Number(
-    coll.mosaic()
-      .select(0)
-      .mask()
-      .reduceRegion({
-        reducer: ee.Reducer.mean(),
-        geometry: aoiGeometry,
-        scale: 500,
-        maxPixels: 1e9,
-        bestEffort: true
-      })
-      .values()
-      .get(0)
+    ee.Algorithms.If(
+      hasImages,
+      coll.mosaic()
+        .select(bandsOut)   // select by name, not position — safer
+        .select(0)
+        .mask()
+        .reduceRegion({
+          reducer: ee.Reducer.mean(),
+          geometry: aoiGeometry,
+          scale: 500,
+          maxPixels: 1e9,
+          bestEffort: true
+        })
+        .values()
+        .get(0),
+      -1   // sentinel: no scenes at all this month, coverage undefined
+    )
   );
 }
 
@@ -169,7 +177,7 @@ taskList.forEach(function(entry, index) {
   // Coverage is logged, not export-blocking — partial-coverage months are
   // retained on purpose; the RBFN gap-fills missing pixels using temporal
   // neighbors. -9999 nodata marks exactly which pixels those are.
-  var coverageLabel = (coverage === null) ? 'n/a' : coverage.toFixed(2);
+  var coverageLabel = (coverage === null || coverage === -1) ? 'n/a' : coverage.toFixed(2);
   print('Exporting ' + entry.y + '-' + entry.m +
         ' (AOI coverage: ' + coverageLabel + ')');
 
@@ -205,4 +213,4 @@ taskList.forEach(function(entry, index) {
 
 print('Queued monthly mosaic exports: float32, explicit nodata, ' +
       'L5>L7 priority, single combined mosaic score, ' +
-      'coverage estimated via raster mask + chunked evaluation.');
+      'coverage estimated via raster mask (empty-collection-safe) + chunked evaluation.');
