@@ -1,165 +1,647 @@
 # src/train.py
+
 """
-Context-Aware RBFN Training Engine.
-Uses temporal neighbors, adaptive window deltas, static features, and ERA5 predictors.
+Root training orchestrator for the Landsat Temporal Gap Filling pipeline.
+Coordinates chronological dataset construction, training-only feature and
+target scaling, RBF centre fitting, Ridge readout estimation, validation,
+testing, and checkpoint persistence.
+
+The RBFN training contract is:
+Input features:
+0:7 Previous Landsat bands
+7:14 Next Landsat bands
+14 Time distance to previous observation
+15 Time distance to next observation
+16 Previous observation availability
+17 Next observation availability
+18 ERA5 precipitation
+19 ERA5 temperature
+20 DEM
+Total input features: 21
+Total output features: 7 Landsat bands
+
+The dataset is responsible for constructing the feature matrices and
+chronological train/validation/test partitions. The trainer is responsible
+for model-specific preprocessing and fitting.
+
+Only the training partition is used to fit feature scalers, target scalers,
+RBF centres, Gaussian gamma, and Ridge readout parameters.
 """
 
 from pathlib import Path
-import numpy as np
-import torch
+from typing import Any, Dict
 import yaml
-import joblib
-import rasterio
 
-from src.models.rbfn import MultiOutputRBFN
 from src.models.train_rbfn import RBFNTrainer
-from src.preprocessing.raster_processor import RasterProcessor
-from src.utils.metrics import compute_rmse
-from src.utils.spatial import generate_spatial_coordinates
+from src.preprocessing.dataset import GapFillDataset
 
 SRC_DIR = Path(__file__).resolve().parent
 ROOT_DIR = SRC_DIR.parent
 CONFIG_PATH = SRC_DIR / "config.yaml"
 
+EXPECTED_IN_FEATURES = 21
+EXPECTED_OUT_FEATURES = 7
 
-def build_time_features(year: int, month: int) -> np.ndarray:
-    month_sin = np.sin(2 * np.pi * month / 12.0)
-    month_cos = np.cos(2 * np.pi * month / 12.0)
-    year_trend = float(year)
-    return np.array([month_sin, month_cos, year_trend], dtype=np.float32)
+EXPECTED_LANDSAT_BANDS = (
+    "Red",
+    "Green",
+    "Blue",
+    "NIR",
+    "SWIR1",
+    "SWIR2",
+    "Thermal",
+)
+
+EXPECTED_INPUT_FEATURES = (
+    "landsat_prev",
+    "landsat_next",
+    "dt_prev",
+    "dt_next",
+    "prev_available",
+    "next_available",
+    "era5_precip",
+    "era5_temp",
+    "dem",
+)
 
 
-def drop_invalid_rows(X_month: np.ndarray, Y_month: np.ndarray):
-    valid_mask = np.isfinite(X_month).all(axis=1) & np.isfinite(Y_month).all(axis=1)
-    return X_month[valid_mask], Y_month[valid_mask]
+def load_config(config_path: Path) -> Dict[str, Any]:
+    """Load and validate the central YAML configuration."""
+    if not config_path.exists():
+        raise FileNotFoundError(
+            f"Configuration file was not found: {config_path}"
+        )
+
+    with config_path.open("r", encoding="utf-8") as file:
+        config = yaml.safe_load(file)
+
+    if not isinstance(config, dict):
+        raise ValueError(
+            "Configuration file must contain a valid dictionary."
+        )
+
+    return config
 
 
-def subsample_pixels(
-    X_month: np.ndarray, Y_month: np.ndarray, n_pixels: int, rng: np.random.Generator
-):
-    total = X_month.shape[0]
-    if total <= n_pixels:
-        return X_month, Y_month
-    idx = rng.choice(total, size=n_pixels, replace=False)
-    return X_month[idx], Y_month[idx]
+def validate_project_contract(
+    config: Dict[str, Any],
+) -> None:
+    """
+    Validate the configuration values required by the RBFN training pipeline.
+    """
+    landsat_config = config.get("landsat", {})
+    bands = landsat_config.get("bands", [])
+
+    if tuple(bands) != EXPECTED_LANDSAT_BANDS:
+        raise ValueError(
+            "The configured Landsat band order does not match the locked "
+            f"RBFN contract. Expected: {list(EXPECTED_LANDSAT_BANDS)}; "
+            f"received: {bands}"
+        )
+
+    configured_num_bands = landsat_config.get("num_bands")
+
+    if configured_num_bands != EXPECTED_OUT_FEATURES:
+        raise ValueError(
+            "landsat.num_bands must be 7 for the locked RBFN contract. "
+            f"Found: {configured_num_bands}"
+        )
+
+    features = config.get("features", {})
+    inputs = features.get("inputs", [])
+
+    if tuple(inputs) != EXPECTED_INPUT_FEATURES:
+        raise ValueError(
+            "The configured RBFN input feature order does not match the "
+            f"locked contract. Expected: {list(EXPECTED_INPUT_FEATURES)}; "
+            f"received: {inputs}"
+        )
 
 
-def main():
-    with open(CONFIG_PATH, "r") as f:
-        config = yaml.safe_load(f)
+def validate_split(split: Any) -> None:
+    """Validate the chronological dataset split dimensions and contents."""
+    required_attributes = (
+        "X_train",
+        "X_val",
+        "X_test",
+        "Y_train",
+        "Y_val",
+        "Y_test",
+        "train_months",
+        "val_months",
+        "test_months",
+    )
 
-    print("=" * 60)
-    print("  Context-Aware RBFN Gap-Fill Training")
-    print("=" * 60)
+    missing_attributes = [
+        name
+        for name in required_attributes
+        if not hasattr(split, name)
+    ]
 
-    processor = RasterProcessor(config)
-    training_start, training_end = config["landsat"]["training_years"]
-    pixels_per_month = config["model"]["rbfn"].get("pixels_per_month", 50000)
-    rng = np.random.default_rng(config["project"]["seed"])
+    if missing_attributes:
+        raise AttributeError(
+            "Dataset split is missing required attributes: "
+            + ", ".join(missing_attributes)
+        )
 
-    dem_path = ROOT_DIR / config["paths"]["static_dir"] / "dem.tif"
-    with rasterio.open(dem_path) as ref:
-        bounds = (ref.bounds.left, ref.bounds.bottom, ref.bounds.right, ref.bounds.top)
+    feature_shapes = {
+        "training": split.X_train.shape,
+        "validation": split.X_val.shape,
+        "test": split.X_test.shape,
+    }
 
-    X_rows, Y_rows = [], []
+    target_shapes = {
+        "training": split.Y_train.shape,
+        "validation": split.Y_val.shape,
+        "test": split.Y_test.shape,
+    }
 
-    for year in range(training_start, training_end + 1):
-        for month in range(1, 13):
-            target_cube = processor.load_landsat_month(year, month)
-            if target_cube is None:
-                continue
-
-            target_shape = target_cube.shape[:2]
-            h, w = target_shape
-
-            # Retrieve closest temporal neighbors
-            neighbors = processor.load_temporal_neighbors(year, month)
-            if neighbors["prev_cube"] is None or neighbors["next_cube"] is None:
-                continue  # Skip if isolated without temporal context
-
-            era5_cube = processor.load_era5_month(year, month, target_shape)
-            if era5_cube is None:
-                continue
-
-            dem_cube = processor.load_static(target_shape)
-            coords_2d = generate_spatial_coordinates(target_shape, bounds)
-            time_feat = build_time_features(year, month)
-            time_grid = np.tile(time_feat, (h * w, 1))
-
-            # Assemble delta time grids
-            dt_grid = np.tile(
-                np.array([neighbors["dt_prev"], neighbors["dt_next"]], dtype=np.float32),
-                (h * w, 1),
+    for partition, shape in feature_shapes.items():
+        if len(shape) != 2:
+            raise ValueError(
+                f"{partition.capitalize()} feature matrix must be 2D; "
+                f"received shape {shape}."
             )
 
-            # Flatten feature matrices
-            prev_flat = neighbors["prev_cube"].reshape(h * w, -1)
-            next_flat = neighbors["next_cube"].reshape(h * w, -1)
-            dem_flat = dem_cube.reshape(h * w, -1)
-            era5_flat = era5_cube.reshape(h * w, -1)
+        if shape[1] != EXPECTED_IN_FEATURES:
+            raise ValueError(
+                f"{partition.capitalize()} feature matrix contains "
+                f"{shape[1]} features; expected "
+                f"{EXPECTED_IN_FEATURES}."
+            )
 
-            # Concatenate into unified context vector
-            X_month = np.hstack([
-                prev_flat,
-                next_flat,
-                dt_grid,
-                dem_flat,
-                coords_2d,
-                time_grid,
-                era5_flat,
-            ])
-            Y_month = target_cube.reshape(h * w, -1)
+    for partition, shape in target_shapes.items():
+        if len(shape) != 2:
+            raise ValueError(
+                f"{partition.capitalize()} target matrix must be 2D; "
+                f"received shape {shape}."
+            )
 
-            X_month, Y_month = drop_invalid_rows(X_month, Y_month)
-            if X_month.shape[0] == 0:
-                continue
+        if shape[1] != EXPECTED_OUT_FEATURES:
+            raise ValueError(
+                f"{partition.capitalize()} target matrix contains "
+                f"{shape[1]} bands; expected "
+                f"{EXPECTED_OUT_FEATURES}."
+            )
 
-            X_month, Y_month = subsample_pixels(X_month, Y_month, pixels_per_month, rng)
-            X_rows.append(X_month)
-            Y_rows.append(Y_month)
+    if len(split.train_months) == 0:
+        raise ValueError(
+            "Training partition contains no months."
+        )
 
-    X_raw = np.vstack(X_rows)
-    Y_raw = np.vstack(Y_rows)
+    if len(split.val_months) == 0:
+        raise ValueError(
+            "Validation partition contains no months."
+        )
 
-    Y_raw = processor.normalize_reflectance(Y_raw)
+    if len(split.test_months) == 0:
+        raise ValueError(
+            "Test partition contains no months."
+        )
 
-    val_ratio = config["model"]["rbfn"]["validation_holdout_ratio"]
-    split_idx = int(X_raw.shape[0] * (1.0 - val_ratio))
+    if split.X_train.shape[0] == 0:
+        raise ValueError(
+            "Training partition contains no valid pixels."
+        )
 
-    X_train_raw, X_val_raw = X_raw[:split_idx], X_raw[split_idx:]
-    Y_train, Y_val = Y_raw[:split_idx], Y_raw[split_idx:]
+    if split.X_val.shape[0] == 0:
+        raise ValueError(
+            "Validation partition contains no valid pixels."
+        )
 
-    processor.fit_scaler(X_train_raw)
-    X_train_scaled = processor.transform_features(X_train_raw)
-    X_val_scaled = processor.transform_features(X_val_raw)
+    if split.X_test.shape[0] == 0:
+        raise ValueError(
+            "Test partition contains no valid pixels."
+        )
 
-    X_train_t = torch.tensor(X_train_scaled, dtype=torch.float32)
-    Y_train_t = torch.tensor(Y_train, dtype=torch.float32)
-    X_val_t = torch.tensor(X_val_scaled, dtype=torch.float32)
-    Y_val_t = torch.tensor(Y_val, dtype=torch.float32)
 
-    model = MultiOutputRBFN(
-        in_features=X_train_t.shape[1],
-        num_centers=config["model"]["rbfn"]["num_centers"],
-        out_bands=config["landsat"]["num_bands"],
+def print_split_summary(split: Any) -> None:
+    """Print chronological dataset split information."""
+    print("\nDataset Split Summary")
+    print("-" * 60)
+    print(
+        f"Training months:   {len(split.train_months)} "
+        f"| {split.train_months[0]} to {split.train_months[-1]}"
     )
 
-    trainer = RBFNTrainer(model, config)
-    trainer.fit_ridge(
-        X_train_t,
-        Y_train_t,
-        lambda_reg=config["model"]["rbfn"]["regularization_lambda"],
+    print(
+        f"Validation months: {len(split.val_months)} "
+        f"| {split.val_months[0]} to {split.val_months[-1]}"
     )
 
-    val_rmse = trainer.evaluate(X_val_t, Y_val_t)
-    print(f"  ✓ Context-Aware Validation RMSE: {val_rmse:.5f}")
+    print(
+        f"Test months:       {len(split.test_months)} "
+        f"| {split.test_months[0]} to {split.test_months[-1]}"
+    )
 
-    checkpoint_dir = ROOT_DIR / config["paths"]["processed_dir"] / "models"
-    checkpoint_dir.mkdir(parents=True, exist_ok=True)
+    print()
 
-    torch.save(model.state_dict(), checkpoint_dir / "rbfn_landsat_gap_filler.pt")
-    joblib.dump(processor.scaler, checkpoint_dir / "feature_scaler.joblib")
-    print(f"  ✓ Checkpoints saved to {checkpoint_dir}")
+    print(
+        f"Training pixels:   {split.X_train.shape[0]:,}"
+    )
+
+    print(
+        f"Validation pixels: {split.X_val.shape[0]:,}"
+    )
+
+    print(
+        f"Test pixels:       {split.X_test.shape[0]:,}"
+    )
+
+    print()
+
+    print(
+        f"Input features:    {split.X_train.shape[1]}"
+    )
+
+    print(
+        f"Output bands:      {split.Y_train.shape[1]}"
+    )
+
+
+def get_training_configuration(
+    config: Dict[str, Any],
+) -> Dict[str, Any]:
+    """Extract and validate RBFN training parameters from configuration."""
+    rbfn_config = config.get("model", {}).get("rbfn", {})
+
+    batch_size = int(
+        rbfn_config.get(
+            "batch_size",
+            4096,
+        )
+    )
+
+    validation_ratio = float(
+        rbfn_config.get(
+            "validation_holdout_ratio",
+            0.22,
+        )
+    )
+
+    test_ratio = float(
+        rbfn_config.get(
+            "test_holdout_ratio",
+            0.15,
+        )
+    )
+
+    num_workers = int(
+        rbfn_config.get(
+            "num_workers",
+            0,
+        )
+    )
+
+    if batch_size <= 0:
+        raise ValueError(
+            "batch_size must be greater than zero."
+        )
+
+    if num_workers < 0:
+        raise ValueError(
+            "num_workers cannot be negative."
+        )
+
+    if not 0.0 < validation_ratio < 1.0:
+        raise ValueError(
+            "validation_holdout_ratio must be between 0 and 1."
+        )
+
+    if not 0.0 < test_ratio < 1.0:
+        raise ValueError(
+            "test_holdout_ratio must be between 0 and 1."
+        )
+
+    if validation_ratio + test_ratio >= 1.0:
+        raise ValueError(
+            "Validation and test holdout ratios must sum to less than 1."
+        )
+
+    return {
+        "batch_size": batch_size,
+        "validation_ratio": validation_ratio,
+        "test_ratio": test_ratio,
+        "num_workers": num_workers,
+        "gamma": rbfn_config.get("gamma"),
+    }
+
+
+def build_dataset_split(
+    config: Dict[str, Any],
+    training_config: Dict[str, Any],
+) -> Any:
+    """Construct the chronological RBFN dataset split."""
+    dataset = GapFillDataset(config)
+
+    result = dataset.create_rbfn_dataloaders(
+        batch_size=training_config["batch_size"],
+        val_ratio=training_config["validation_ratio"],
+        test_ratio=training_config["test_ratio"],
+        num_workers=training_config["num_workers"],
+    )
+
+    if not isinstance(result, tuple) or len(result) != 4:
+        raise ValueError(
+            "GapFillDataset.create_rbfn_dataloaders() must return "
+            "(train_loader, val_loader, test_loader, split)."
+        )
+
+    _, _, _, split = result
+
+    validate_split(split)
+
+    return split
+
+
+def evaluate_partition(
+    trainer: RBFNTrainer,
+    X_scaled: Any,
+    Y_scaled: Any,
+    Y_raw: Any,
+    partition_name: str,
+) -> Dict[str, float]:
+    """Evaluate one dataset partition and print its trainer metrics."""
+    metrics = trainer.evaluate(
+        X_eval_scaled=X_scaled,
+        Y_eval_scaled=Y_scaled,
+        Y_eval_raw=Y_raw,
+    )
+
+    print(f"\n{partition_name} Metrics")
+    print("-" * 60)
+
+    print(
+        f"Scaled MSE:     "
+        f"{metrics['eval_mse_scaled']:.8f}"
+    )
+
+    print(
+        f"Physical RMSE:  "
+        f"{metrics['eval_rmse_physical']:.8f}"
+    )
+
+    print(
+        f"R²:             "
+        f"{metrics['eval_r2']:.6f}"
+    )
+
+    return {
+        key: float(value)
+        for key, value in metrics.items()
+    }
+
+
+def save_training_outputs(
+    trainer: RBFNTrainer,
+    config: Dict[str, Any],
+    split: Any,
+    training_mse: float,
+    validation_metrics: Dict[str, float],
+    test_metrics: Dict[str, float],
+) -> None:
+    """Save the trained model, scalers, and reproducibility metadata."""
+    processed_dir = (
+        ROOT_DIR
+        / config["paths"]["processed_dir"]
+    )
+
+    checkpoint_dir = processed_dir / "models"
+
+    checkpoint_dir.mkdir(
+        parents=True,
+        exist_ok=True,
+    )
+
+    model_path = (
+        checkpoint_dir
+        / "rbfn_landsat_gap_filler.pt"
+    )
+
+    scaler_path = (
+        checkpoint_dir
+        / "rbfn_scalers.joblib"
+    )
+
+    gamma = (
+        trainer.model.gamma
+        .detach()
+        .cpu()
+        .item()
+    )
+
+    metadata = {
+        "training_months": list(
+            split.train_months
+        ),
+        "validation_months": list(
+            split.val_months
+        ),
+        "test_months": list(
+            split.test_months
+        ),
+        "in_features": EXPECTED_IN_FEATURES,
+        "out_features": EXPECTED_OUT_FEATURES,
+        "num_centers": int(
+            trainer.num_centers
+        ),
+        "regularization_lambda": float(
+            trainer.regularization_lambda
+        ),
+        "gamma": float(gamma),
+        "chunk_size": int(
+            trainer.chunk_size
+        ),
+        "training_scaled_mse": float(
+            training_mse
+        ),
+        "validation_metrics": validation_metrics,
+        "test_metrics": test_metrics,
+    }
+
+    trainer.save_checkpoint(
+        model_path=str(model_path),
+        scaler_path=str(scaler_path),
+        metadata=metadata,
+    )
+
+    print("\nSaved Training Outputs")
+    print("-" * 60)
+
+    print(
+        f"Model checkpoint:  {model_path}"
+    )
+
+    print(
+        f"Scaler checkpoint: {scaler_path}"
+    )
+
+
+def main() -> None:
+    """Execute the complete RBFN training pipeline."""
+    config = load_config(
+        CONFIG_PATH
+    )
+
+    validate_project_contract(
+        config
+    )
+
+    print("=" * 70)
+    print("LANDSAT TEMPORAL GAP FILLING")
+    print("RBFN TRAINING PIPELINE")
+    print("=" * 70)
+
+    training_config = (
+        get_training_configuration(
+            config
+        )
+    )
+
+    print(
+        "\n1. Building chronological dataset"
+    )
+
+    split = build_dataset_split(
+        config=config,
+        training_config=training_config,
+    )
+
+    print_split_summary(
+        split
+    )
+
+    print(
+        "\n2. Initializing RBFN trainer"
+    )
+
+    trainer = RBFNTrainer(
+        config=config,
+        in_features=EXPECTED_IN_FEATURES,
+        out_features=EXPECTED_OUT_FEATURES,
+    )
+
+    print(
+        f"Device:               {trainer.device}"
+    )
+
+    print(
+        f"RBF centres:          {trainer.num_centers}"
+    )
+
+    print(
+        f"Regularization lambda: "
+        f"{trainer.regularization_lambda}"
+    )
+
+    print(
+        f"Chunk size:           "
+        f"{trainer.chunk_size:,}"
+    )
+
+    print(
+        "\n3. Fitting training-only scalers"
+    )
+
+    X_train_scaled, Y_train_scaled = (
+        trainer.fit_scalers(
+            split.X_train,
+            split.Y_train,
+        )
+    )
+
+    X_val_scaled = (
+        trainer.transform_features(
+            split.X_val
+        )
+    )
+
+    Y_val_scaled = (
+        trainer.transform_targets(
+            split.Y_val
+        )
+    )
+
+    X_test_scaled = (
+        trainer.transform_features(
+            split.X_test
+        )
+    )
+
+    Y_test_scaled = (
+        trainer.transform_targets(
+            split.Y_test
+        )
+    )
+
+    print(
+        "Training feature and target scalers fitted."
+    )
+
+    print(
+        "\n4. Fitting RBF centres and Ridge readout"
+    )
+
+    training_mse = trainer.fit_ridge(
+        X_train_scaled=X_train_scaled,
+        Y_train_scaled=Y_train_scaled,
+        user_gamma=training_config["gamma"],
+    )
+
+    print(
+        f"Training scaled MSE: "
+        f"{training_mse:.8f}"
+    )
+
+    print(
+        "\n5. Evaluating validation partition"
+    )
+
+    validation_metrics = evaluate_partition(
+        trainer=trainer,
+        X_scaled=X_val_scaled,
+        Y_scaled=Y_val_scaled,
+        Y_raw=split.Y_val,
+        partition_name="Validation",
+    )
+
+    print(
+        "\n6. Evaluating final test partition"
+    )
+
+    test_metrics = evaluate_partition(
+        trainer=trainer,
+        X_scaled=X_test_scaled,
+        Y_scaled=Y_test_scaled,
+        Y_raw=split.Y_test,
+        partition_name="Test",
+    )
+
+    print(
+        "\n7. Saving model checkpoint"
+    )
+
+    save_training_outputs(
+        trainer=trainer,
+        config=config,
+        split=split,
+        training_mse=training_mse,
+        validation_metrics=validation_metrics,
+        test_metrics=test_metrics,
+    )
+
+    print(
+        "\n"
+        + "=" * 70
+    )
+
+    print(
+        "RBFN TRAINING COMPLETED SUCCESSFULLY"
+    )
+
+    print(
+        "=" * 70
+    )
 
 
 if __name__ == "__main__":

@@ -1,59 +1,49 @@
 # src/models/tuning.py
+
 """
 Hyperparameter tuning module for the Radial Basis Function Network (RBFN).
-
 Performs exhaustive grid search over:
 
-    - Number of RBF centres
-    - Ridge regularization strength
-    - Gamma multiplier
-
+- Number of RBF centres
+- Ridge regularization strength
+- Gamma multiplier
 using a strict chronological:
 
-    Training -> Validation -> Test
-
+Training -> Validation -> Test
 partition.
-
-The training set is used to fit scalers, K-Means centres, gamma and Ridge
-weights.
-
-The validation set is used exclusively for hyperparameter/model selection.
-
-The test set remains completely untouched until the best configuration has
-been selected and is evaluated exactly once for final reporting.
+Scalers, K-Means centres, gamma, and Ridge weights are fitted using the
+training split only. The validation split is used exclusively for
+hyperparameter selection. The test split remains untouched until the
+selected configuration has been evaluated for final reporting.
 """
-
 from copy import deepcopy
 from pathlib import Path
 from typing import Any, Dict, List, Optional
 import itertools
 import json
 import math
-
 from src.models.train_rbfn import RBFNTrainer
 from src.preprocessing.dataset import GapFillDataset
+
+EXPECTED_IN_FEATURES = 21
+EXPECTED_OUT_FEATURES = 7
 
 
 class RBFNHyperparameterTuner:
     """
     Performs systematic grid-search hyperparameter optimization for RBFN.
     """
-
     def __init__(
         self,
         base_config: dict,
     ):
         self.base_config = base_config
 
-        self.output_dir = (
-            Path(
-                base_config["project"].get(
-                    "output_dir",
-                    "./outputs",
-                )
-            )
-            / "tuning"
+        output_root = Path(
+            base_config["paths"]["outputs_dir"]
         )
+
+        self.output_dir = output_root / "tuning"
 
         self.output_dir.mkdir(
             parents=True,
@@ -67,19 +57,23 @@ class RBFNHyperparameterTuner:
         """
         Expand parameter lists into exhaustive combinations.
         """
-
         if not search_space:
             raise ValueError(
                 "search_space cannot be empty."
             )
 
-        keys = list(
-            search_space.keys()
-        )
+        keys = list(search_space.keys())
+        values = list(search_space.values())
 
-        values = list(
-            search_space.values()
-        )
+        if any(
+            not isinstance(parameter_values, list)
+            or not parameter_values
+            for parameter_values in values
+        ):
+            raise ValueError(
+                "Every search-space parameter must contain "
+                "a non-empty list of candidate values."
+            )
 
         return [
             dict(zip(keys, combination))
@@ -88,18 +82,82 @@ class RBFNHyperparameterTuner:
             )
         ]
 
+    def _get_default_search_space(
+        self,
+    ) -> Dict[str, List[Any]]:
+        """
+        Return the default RBFN hyperparameter search space.
+        """
+        return {
+            "num_centers": [
+                25,
+                50,
+                100,
+                200,
+            ],
+            "regularization_lambda": [
+                1e-4,
+                1e-3,
+                1e-2,
+                1e-1,
+            ],
+            "gamma_multiplier": [
+                0.2,
+                0.5,
+                1.0,
+                2.0,
+            ],
+        }
+
+    def _get_split_ratios(
+        self,
+        val_ratio: Optional[float],
+        test_ratio: Optional[float],
+    ) -> tuple[float, float]:
+        """
+        Resolve temporal holdout ratios from explicit arguments or config.
+        """
+        rbfn_config = self.base_config["model"]["rbfn"]
+
+        if val_ratio is None:
+            val_ratio = float(
+                rbfn_config["validation_holdout_ratio"]
+            )
+
+        if test_ratio is None:
+            test_ratio = float(
+                rbfn_config["test_holdout_ratio"]
+            )
+
+        if not 0.0 < val_ratio < 1.0:
+            raise ValueError(
+                "val_ratio must be greater than 0 and less than 1."
+            )
+
+        if not 0.0 < test_ratio < 1.0:
+            raise ValueError(
+                "test_ratio must be greater than 0 and less than 1."
+            )
+
+        if val_ratio + test_ratio >= 1.0:
+            raise ValueError(
+                "val_ratio + test_ratio must be less than 1."
+            )
+
+        return val_ratio, test_ratio
+
     def run_grid_search(
         self,
         search_space: Optional[
             Dict[str, List[Any]]
         ] = None,
-        test_ratio: float = 0.15,
-        val_ratio: float = 0.20,
+        test_ratio: Optional[float] = None,
+        val_ratio: Optional[float] = None,
     ) -> Dict[str, Any]:
         """
-        Execute exhaustive grid search.
+        Execute exhaustive RBFN grid search.
 
-        Default search space:
+        The default search space contains:
 
             num_centers:
                 [25, 50, 100, 200]
@@ -110,44 +168,25 @@ class RBFNHyperparameterTuner:
             gamma_multiplier:
                 [0.2, 0.5, 1.0, 2.0]
 
-        The total number of configurations is therefore:
+        This produces 64 configurations.
 
-            4 x 4 x 4 = 64 trials
+        Model selection criterion:
 
-        Selection criterion:
+            Minimum validation RMSE on the physical target scale.
 
-            Minimum validation RMSE on the physical reflectance scale.
+        The test split is evaluated only after the best configuration has
+        been selected using validation data.
         """
-
-        # ------------------------------------------------------------------
-        # 1. Define default search space
-        # ------------------------------------------------------------------
         if search_space is None:
-            search_space = {
-                "num_centers": [
-                    25,
-                    50,
-                    100,
-                    200,
-                ],
-                "regularization_lambda": [
-                    1e-4,
-                    1e-3,
-                    1e-2,
-                    1e-1,
-                ],
-                "gamma_multiplier": [
-                    0.2,
-                    0.5,
-                    1.0,
-                    2.0,
-                ],
-            }
+            search_space = self._get_default_search_space()
 
-        param_combinations = (
-            self._generate_param_grid(
-                search_space
-            )
+        val_ratio, test_ratio = self._get_split_ratios(
+            val_ratio=val_ratio,
+            test_ratio=test_ratio,
+        )
+
+        param_combinations = self._generate_param_grid(
+            search_space
         )
 
         print(
@@ -155,9 +194,6 @@ class RBFNHyperparameterTuner:
             f"across {len(param_combinations)} configurations..."
         )
 
-        # ------------------------------------------------------------------
-        # 2. Build monthly dataset
-        # ------------------------------------------------------------------
         dataset_builder = GapFillDataset(
             self.base_config
         )
@@ -166,9 +202,11 @@ class RBFNHyperparameterTuner:
             dataset_builder.build_monthly_samples()
         )
 
-        # ------------------------------------------------------------------
-        # 3. Create strict chronological split
-        # ------------------------------------------------------------------
+        if not monthly_samples:
+            raise RuntimeError(
+                "No valid monthly training samples were generated."
+            )
+
         split = (
             dataset_builder.create_temporal_holdout(
                 monthly_samples=monthly_samples,
@@ -177,76 +215,72 @@ class RBFNHyperparameterTuner:
             )
         )
 
-        print(
-            "\nTemporal split:"
-        )
+        if len(split.X_train) == 0:
+            raise RuntimeError(
+                "The training split contains no samples."
+            )
 
+        if len(split.X_val) == 0:
+            raise RuntimeError(
+                "The validation split contains no samples."
+            )
+
+        if len(split.X_test) == 0:
+            raise RuntimeError(
+                "The test split contains no samples."
+            )
+
+        if split.X_train.shape[1] != EXPECTED_IN_FEATURES:
+            raise ValueError(
+                f"Expected {EXPECTED_IN_FEATURES} input features, "
+                f"received {split.X_train.shape[1]}."
+            )
+
+        if split.Y_train.shape[1] != EXPECTED_OUT_FEATURES:
+            raise ValueError(
+                f"Expected {EXPECTED_OUT_FEATURES} output bands, "
+                f"received {split.Y_train.shape[1]}."
+            )
+
+        print("\nTemporal split:")
         print(
             f"  Training months: "
             f"{split.train_months[0]} -> "
             f"{split.train_months[-1]}"
         )
-
         print(
             f"  Validation months: "
             f"{split.val_months[0]} -> "
             f"{split.val_months[-1]}"
         )
-
         print(
             f"  Test months: "
             f"{split.test_months[0]} -> "
             f"{split.test_months[-1]}"
         )
-
         print(
             f"  Training samples: {len(split.X_train)}"
         )
-
         print(
             f"  Validation samples: {len(split.X_val)}"
         )
-
         print(
             f"  Test samples: {len(split.X_test)}"
         )
 
-        # ------------------------------------------------------------------
-        # 4. Infer dimensions from actual extracted matrices
-        # ------------------------------------------------------------------
-        in_features = (
-            split.X_train.shape[1]
-        )
+        in_features = split.X_train.shape[1]
+        out_features = split.Y_train.shape[1]
 
-        out_features = (
-            split.Y_train.shape[1]
-        )
+        results: List[Dict[str, Any]] = []
 
-        # ------------------------------------------------------------------
-        # 5. Initialize tuning state
-        # ------------------------------------------------------------------
-        results: List[
-            Dict[str, Any]
-        ] = []
+        best_val_score = float("inf")
+        best_params: Optional[Dict[str, Any]] = None
+        best_trainer: Optional[RBFNTrainer] = None
 
-        best_val_score = float(
-            "inf"
-        )
-
-        best_params = None
-        best_trainer = None
-
-        # ------------------------------------------------------------------
-        # 6. Run grid search
-        # ------------------------------------------------------------------
         for idx, params in enumerate(
             param_combinations,
             start=1,
         ):
-
-            # --------------------------------------------------------------
-            # Create isolated trial configuration.
-            # --------------------------------------------------------------
             trial_config = deepcopy(
                 self.base_config
             )
@@ -261,22 +295,16 @@ class RBFNHyperparameterTuner:
                 {},
             )
 
-            trial_config["model"][
-                "rbfn"
-            ].update(params)
+            trial_config["model"]["rbfn"].update(
+                params
+            )
 
-            # --------------------------------------------------------------
-            # Construct trial trainer
-            # --------------------------------------------------------------
             trainer = RBFNTrainer(
                 config=trial_config,
                 in_features=in_features,
                 out_features=out_features,
             )
 
-            # --------------------------------------------------------------
-            # Fit scalers ONLY on training data
-            # --------------------------------------------------------------
             (
                 X_train_scaled,
                 Y_train_scaled,
@@ -297,18 +325,6 @@ class RBFNHyperparameterTuner:
                 )
             )
 
-            # --------------------------------------------------------------
-            # Fit RBFN using training data ONLY
-            #
-            # K-Means:
-            #     training features only
-            #
-            # Gamma:
-            #     derived from training K-Means centres
-            #
-            # Ridge:
-            #     training RBF activations + targets
-            # --------------------------------------------------------------
             train_mse_scaled = (
                 trainer.fit_ridge(
                     X_train_scaled,
@@ -316,56 +332,42 @@ class RBFNHyperparameterTuner:
                 )
             )
 
-            # --------------------------------------------------------------
-            # Evaluate ONLY on validation set for model selection
-            # --------------------------------------------------------------
             val_metrics = trainer.evaluate(
                 X_eval_scaled=X_val_scaled,
                 Y_eval_scaled=Y_val_scaled,
                 Y_eval_raw=split.Y_val,
             )
 
-            val_rmse = (
-                val_metrics[
-                    "eval_rmse_physical"
-                ]
+            val_rmse = float(
+                val_metrics["eval_rmse_physical"]
             )
 
             fitted_gamma = float(
                 trainer.model.gamma.item()
             )
 
-            # --------------------------------------------------------------
-            # Store trial
-            # --------------------------------------------------------------
             record = {
                 "trial_id": idx,
                 "params": params,
                 "fitted_gamma": fitted_gamma,
-                "train_mse_scaled": train_mse_scaled,
+                "train_mse_scaled": float(
+                    train_mse_scaled
+                ),
                 "val_metrics": val_metrics,
             }
 
-            results.append(
-                record
-            )
+            results.append(record)
 
-            # --------------------------------------------------------------
-            # Console output
-            # --------------------------------------------------------------
             print(
                 f"[{idx}/{len(param_combinations)}] "
                 f"K={params['num_centers']} | "
                 f"Lambda={params['regularization_lambda']:.1e} | "
-                f"Gamma multiplier={params['gamma_multiplier']:.2f} | "
+                f"Gamma multiplier="
+                f"{params['gamma_multiplier']:.2f} | "
                 f"Gamma={fitted_gamma:.6f} | "
-                f"Val RMSE={val_rmse:.6f} | "
-                f"Val R²={val_metrics['eval_r2']:.6f}"
+                f"Val RMSE={val_rmse:.6f}"
             )
 
-            # --------------------------------------------------------------
-            # Select best model using validation RMSE
-            # --------------------------------------------------------------
             if (
                 math.isfinite(val_rmse)
                 and val_rmse < best_val_score
@@ -376,17 +378,11 @@ class RBFNHyperparameterTuner:
                 )
                 best_trainer = trainer
 
-        # ------------------------------------------------------------------
-        # 7. Ensure a valid model was selected
-        # ------------------------------------------------------------------
-        if best_trainer is None:
+        if best_trainer is None or best_params is None:
             raise RuntimeError(
                 "Grid search failed to identify a valid model."
             )
 
-        # ------------------------------------------------------------------
-        # 8. Evaluate BEST model on untouched test set
-        # ------------------------------------------------------------------
         print(
             "\nRunning final evaluation on "
             "the untouched test set..."
@@ -404,24 +400,14 @@ class RBFNHyperparameterTuner:
             )
         )
 
-        test_metrics = (
-            best_trainer.evaluate(
-                X_eval_scaled=X_test_scaled,
-                Y_eval_scaled=Y_test_scaled,
-                Y_eval_raw=split.Y_test,
-            )
+        test_metrics = best_trainer.evaluate(
+            X_eval_scaled=X_test_scaled,
+            Y_eval_scaled=Y_test_scaled,
+            Y_eval_raw=split.Y_test,
         )
 
-        final_test_rmse = (
-            test_metrics[
-                "eval_rmse_physical"
-            ]
-        )
-
-        final_test_r2 = (
-            test_metrics[
-                "eval_r2"
-            ]
+        final_test_rmse = float(
+            test_metrics["eval_rmse_physical"]
         )
 
         print(
@@ -429,14 +415,6 @@ class RBFNHyperparameterTuner:
             f"{final_test_rmse:.6f}"
         )
 
-        print(
-            f"Final Test R²: "
-            f"{final_test_r2:.6f}"
-        )
-
-        # ------------------------------------------------------------------
-        # 9. Construct tuning summary
-        # ------------------------------------------------------------------
         summary = {
             "num_trials": len(
                 param_combinations
@@ -455,6 +433,8 @@ class RBFNHyperparameterTuner:
                     len(split.test_months)
                     / len(monthly_samples)
                 ),
+                "configured_validation_ratio": val_ratio,
+                "configured_test_ratio": test_ratio,
                 "train_months": split.train_months,
                 "val_months": split.val_months,
                 "test_months": split.test_months,
@@ -470,9 +450,6 @@ class RBFNHyperparameterTuner:
             "all_trials": results,
         }
 
-        # ------------------------------------------------------------------
-        # 10. Save tuning history
-        # ------------------------------------------------------------------
         summary_path = (
             self.output_dir
             / "tuning_summary.json"
@@ -490,9 +467,6 @@ class RBFNHyperparameterTuner:
                 allow_nan=False,
             )
 
-        # ------------------------------------------------------------------
-        # 11. Save selected model
-        # ------------------------------------------------------------------
         best_trainer.save_checkpoint(
             model_path=str(
                 self.output_dir
@@ -500,7 +474,7 @@ class RBFNHyperparameterTuner:
             ),
             scaler_path=str(
                 self.output_dir
-                / "best_rbfn_scalers.pkl"
+                / "best_rbfn_scalers.joblib"
             ),
             metadata={
                 "tuning_summary": summary,
@@ -511,33 +485,21 @@ class RBFNHyperparameterTuner:
             },
         )
 
-        # ------------------------------------------------------------------
-        # 12. Final reporting
-        # ------------------------------------------------------------------
         print(
             "\nRBFN tuning complete."
         )
-
         print(
             f"Best validation RMSE: "
             f"{best_val_score:.6f}"
         )
-
         print(
             f"Final test RMSE: "
             f"{final_test_rmse:.6f}"
         )
-
-        print(
-            f"Final test R²: "
-            f"{final_test_r2:.6f}"
-        )
-
         print(
             f"Best parameters: "
             f"{best_params}"
         )
-
         print(
             f"Tuning summary saved to: "
             f"{summary_path}"

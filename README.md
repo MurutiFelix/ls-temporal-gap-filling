@@ -14,7 +14,7 @@
 ├── data/                              # ALL EXPERIMENT DATA MODALITIES
 │   ├── landsat/                        # Unprocessed Landsat data (R,G,B,NIR,SWIR1,SWIR2,Thermal layers)
 │   ├── avhrr/                          # avhrr ndvi for missing years
-│   
+│   ├── modis/                          # modis ndvi 
 │   ├── static/                         # Landscape invariant -DEM
 │   ├── era5/ 
 │   │     ├── precip
@@ -34,8 +34,7 @@
     │
     ├── preprocessing/                 # DATA ENGINEERING & RASTER PROCESSING
     │   ├── dataset.py                  # PyTorch Dataset/DataLoader for RBFN streaming
-    │   ├── raster_processor.py         # Resampling, scale standardization (0-1), 3D-to-2D matrix flattening
-    │   └── indices.py                  # Downstream eval indices
+    │   └──  raster_processor.py         # Resampling, scale standardization (0-1), 3D-to-2D matrix flattening
     │
     ├── models/                        # MODEL ARCHITECTURES & TRAINING PIPELINES
     │   ├── run_rbfn.sh                 # Slurm HPC script for PyTorch RBFN training

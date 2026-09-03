@@ -1,771 +1,1017 @@
 # src/preprocessing/raster_processor.py
+"""
+Central raster discovery, loading, and spatial alignment utilities.
+
+Handles the 7-band Landsat reordering from source to model order:
+Source Order: 1. Blue, 2. Green, 3. Red, 4. NIR, 5. SWIR1, 6. SWIR2, 7. Thermal
+Model Order:  Red, Green, Blue, NIR, SWIR1, SWIR2, Thermal
+"""
+
 
 """
-Central raster discovery, loading and spatial alignment utilities.
-
+Central raster discovery, loading, and spatial alignment utilities.
 This module is responsible for:
 
-- Resolving project paths from config.yaml
-- Discovering complete Landsat monthly observations
-- Detecting missing Landsat months
-- Defining a common target grid
-- Reprojecting and resampling rasters to that grid
-- Converting NoData values to NaN
-- Loading complete Landsat monthly raster cubes
-- Loading ERA5 precipitation and temperature predictors
-- Loading the static DEM
-- Retrieving temporal Landsat neighbours
-- Loading AVHRR and MODIS NDVI evaluation data
+Resolving project paths from config.yaml
+Discovering monthly Landsat observations stored as seven-band GeoTIFFs
+Validating complete Landsat observations and source band structure
+Explicitly mapping Landsat source bands to the model band order
+Detecting missing Landsat months
+Defining and caching a common target grid
+Reprojecting and resampling rasters to the target grid
+Converting source NoData and invalid values to NaN
+Loading complete Landsat monthly raster cubes
+Loading ERA5 precipitation and temperature predictors
+Loading and caching the static DEM
+Retrieving the nearest previous and next Landsat observations
+Computing temporal distances and Landsat availability indicators
+Loading AVHRR and MODIS NDVI evaluation data
 
-All rasters returned by this processor are aligned to the same target grid.
+Landsat observations are stored as one stacked seven-band GeoTIFF per
+month using the following source raster band order:
+Source Band 1: Blue
+Source Band 2: Green
+Source Band 3: Red
+Source Band 4: NIR
+Source Band 5: SWIR1
+Source Band 6: SWIR2
+Source Band 7: Thermal
+
+The model uses the following band order:
+Model Band 0: Red
+Model Band 1: Green
+Model Band 2: Blue
+Model Band 3: NIR
+Model Band 4: SWIR1
+Model Band 5: SWIR2
+Model Band 6: Thermal
+
+Expected Landsat filename pattern:
+landsat_YYYY_MM_lX.tif
 """
 
+from __future__ import annotations
+
 from pathlib import Path
-from typing import Any, Dict, List, Optional, Tuple
+from typing import Any, Dict, List, Optional, Tuple, Union
 
 import numpy as np
 import rasterio
+import yaml
 from rasterio.enums import Resampling
 from rasterio.warp import reproject
+
+EXPECTED_LANDSAT_BANDS = 7
+
+MODEL_BAND_ORDER = (
+    "Red",
+    "Green",
+    "Blue",
+    "NIR",
+    "SWIR1",
+    "SWIR2",
+    "Thermal",
+)
+
+# 1-based source GeoTIFF band indexing -> model band mapping
+SOURCE_TO_MODEL_INDEX = {
+    "Red": 3,
+    "Green": 2,
+    "Blue": 1,
+    "NIR": 4,
+    "SWIR1": 5,
+    "SWIR2": 6,
+    "Thermal": 7,
+}
 
 
 class RasterProcessor:
     """
-    Central raster-processing component for the Landsat temporal gap-filling
-    pipeline.
+    Handles raster discovery, spatial alignment, Landsat temporal
+    neighbourhood loading, predictor loading, and evaluation-raster loading.
     """
 
     def __init__(
         self,
-        config: Dict[str, Any],
+        config_or_path: Union[str, Path, Dict[str, Any]]
     ) -> None:
-        """
-        Initialize paths, Landsat configuration and spatial settings.
-        """
 
-        self.config = config
+        if isinstance(config_or_path, (str, Path)):
+            self.config_path = Path(config_or_path)
 
-        paths_config = config.get(
-            "paths",
-            {},
-        )
+            if not self.config_path.exists():
+                raise FileNotFoundError(
+                    f"Configuration file not found: {self.config_path}"
+                )
 
-        self.data_dir = Path(
-            paths_config.get(
-                "data_dir",
-                "data",
+            with open(
+                self.config_path,
+                "r",
+                encoding="utf-8"
+            ) as file:
+                self.config = yaml.safe_load(file)
+
+            self.project_root = self.config_path.parent.parent
+
+        elif isinstance(config_or_path, dict):
+            self.config = config_or_path
+            self.config_path = Path("config.yaml")
+            self.project_root = Path.cwd()
+
+        else:
+            raise TypeError(
+                "config_or_path must be a file path or a configuration dict."
             )
+
+        if not isinstance(self.config, dict):
+            raise ValueError(
+                "Configuration must be a dictionary or YAML mapping."
+            )
+
+        paths_config = self.config.get("paths", {})
+        landsat_config = self.config.get("landsat", {})
+        temporal_config = self.config.get(
+            "temporal_features",
+            {}
+        )
+        temporal_context = temporal_config.get(
+            "temporal_context",
+            {}
         )
 
-        self.landsat_dir = Path(
+        self.landsat_dir = self._resolve_path(
             paths_config.get(
                 "landsat_dir",
-                self.data_dir / "landsat",
+                "data/landsat"
             )
         )
 
-        self.avhrr_dir = Path(
+        self.avhrr_dir = self._resolve_path(
             paths_config.get(
                 "avhrr_dir",
-                self.data_dir / "avhrr",
+                "data/avhrr"
             )
         )
 
-        self.modis_dir = Path(
+        self.modis_dir = self._resolve_path(
             paths_config.get(
                 "modis_dir",
-                self.data_dir / "modis",
+                "data/modis"
             )
         )
 
-        self.static_dir = Path(
+        self.static_dir = self._resolve_path(
             paths_config.get(
                 "static_dir",
-                self.data_dir / "static",
+                "data/static"
             )
         )
 
-        self.era5_precip_dir = Path(
+        self.era5_precip_dir = self._resolve_path(
             paths_config.get(
                 "era5_precip_dir",
-                self.data_dir / "era5" / "precip",
+                "data/era5/precip"
             )
         )
 
-        self.era5_temp_dir = Path(
+        self.era5_temp_dir = self._resolve_path(
             paths_config.get(
                 "era5_temp_dir",
-                self.data_dir / "era5" / "temp",
+                "data/era5/temp"
             )
         )
 
-        self.landsat_bands = list(
-            config.get(
-                "landsat",
-                {},
-            ).get(
-                "bands",
-                [],
-            )
+        configured_bands = tuple(
+            landsat_config.get("bands", [])
         )
 
-        if not self.landsat_bands:
+        if len(configured_bands) != EXPECTED_LANDSAT_BANDS:
             raise ValueError(
-                "No Landsat bands are defined in config.yaml."
+                f"Landsat configuration must contain exactly "
+                f"{EXPECTED_LANDSAT_BANDS} bands. "
+                f"Found {len(configured_bands)}."
             )
 
-        landsat_config = config.get(
-            "landsat",
-            {},
+        if configured_bands != MODEL_BAND_ORDER:
+            raise ValueError(
+                "Landsat band order in config.yaml must be exactly: "
+                f"{list(MODEL_BAND_ORDER)}. "
+                f"Found: {list(configured_bands)}"
+            )
+
+        self.landsat_bands = configured_bands
+        self.num_bands = EXPECTED_LANDSAT_BANDS
+
+        data_years = landsat_config.get(
+            "data_years",
+            [1995, 2025]
         )
 
-        self.data_years = (
-            int(
-                landsat_config.get(
-                    "data_years",
-                    [1995, 2025],
-                )[0]
-            ),
-            int(
-                landsat_config.get(
-                    "data_years",
-                    [1995, 2025],
-                )[1]
-            ),
-        )
+        if len(data_years) != 2:
+            raise ValueError(
+                "landsat.data_years must contain "
+                "[start_year, end_year]."
+            )
 
-        temporal_config = config.get(
-            "temporal_features",
-            {},
-        ).get(
-            "temporal_context",
-            {},
-        )
+        self.data_start_year = int(data_years[0])
+        self.data_end_year = int(data_years[1])
+
+        if self.data_start_year > self.data_end_year:
+            raise ValueError(
+                "landsat.data_years start year cannot be greater than end year."
+            )
 
         self.max_search_months = int(
-            temporal_config.get(
+            temporal_context.get(
                 "max_search_months",
-                12,
+                12
             )
         )
 
-        preprocessing_config = config.get(
+        if self.max_search_months < 1:
+            raise ValueError(
+                "max_search_months must be at least 1."
+            )
+
+        preprocessing_config = self.config.get(
             "preprocessing",
-            {},
+            {}
         )
 
-        self.spatial_alignment = bool(
-            preprocessing_config.get(
-                "spatial_alignment",
-                True,
+        target_grid_config = preprocessing_config.get(
+            "target_grid",
+            {}
+        )
+
+        self.target_resolution = float(
+            target_grid_config.get(
+                "resolution",
+                30
             )
         )
-
-        self._target_profile: Optional[
-            Dict[str, Any]
-        ] = None
 
         self._landsat_index: Optional[
-            Dict[
-                Tuple[int, int],
-                Dict[str, Path],
-            ]
+            Dict[Tuple[int, int], Path]
         ] = None
 
+        self._target_profile: Optional[dict] = None
+        self._cached_dem: Optional[np.ndarray] = None
+
+    def _resolve_path(
+        self,
+        configured_path: Union[str, Path]
+    ) -> Path:
+        """
+        Resolve a configured path relative to the project root.
+        """
+        path = Path(configured_path)
+
+        if path.is_absolute():
+            return path
+
+        return self.project_root / path
+
     @staticmethod
-    def _month_string(
+    def _validate_year_month(
         year: int,
-        month: int,
+        month: int
+    ) -> Tuple[int, int]:
+        """
+        Validate and normalize a year/month pair.
+        """
+        year = int(year)
+        month = int(month)
+
+        if year < 1 or month < 1 or month > 12:
+            raise ValueError(
+                f"Invalid date specification: {year}-{month:02d}"
+            )
+
+        return year, month
+
+    @staticmethod
+    def _month_key_to_string(
+        year: int,
+        month: int
     ) -> str:
         """
-        Convert year and month to YYYY-MM format.
+        Convert a year/month pair into YYYY_MM format.
         """
+        return f"{int(year)}_{int(month):02d}"
 
-        return (
-            f"{int(year):04d}-"
-            f"{int(month):02d}"
-        )
-
-    @staticmethod
-    def _validate_month(
-        year: int,
-        month: int,
-    ) -> None:
-        """
-        Validate temporal identifiers.
-        """
-
-        if month < 1 or month > 12:
-            raise ValueError(
-                f"Invalid month: {month}. "
-                "Month must be between 1 and 12."
-            )
-
-        if year < 1:
-            raise ValueError(
-                f"Invalid year: {year}."
-            )
-
-    def _find_band_file(
+    def _find_landsat_file(
         self,
-        band: str,
         year: int,
-        month: int,
+        month: int
     ) -> Optional[Path]:
         """
-        Find a Landsat raster file for one band and month.
+        Find the single stacked Landsat GeoTIFF for a month.
 
-        The expected naming structure contains:
-
-            band_year_month
+        Expected naming:
+            landsat_YYYY_MM_lX.tif
 
         Examples:
-
-            Red_2001_05.tif
-            NIR_2001_05_scene.tif
-
-        Additional filename components after the month are permitted.
+            landsat_2023_01_l8.tif
+            landsat_2012_03_l5.tif
         """
-
-        month_string = (
-            f"{int(month):02d}"
+        year, month = self._validate_year_month(
+            year,
+            month
         )
 
-        patterns = [
-            f"{band}_{year}_{month_string}.tif",
-            f"{band}_{year}_{month_string}_*.tif",
-        ]
+        month_string = self._month_key_to_string(
+            year,
+            month
+        )
 
-        for pattern in patterns:
-            matches = sorted(
-                self.landsat_dir.glob(pattern)
+        exact_pattern = f"landsat_{month_string}.tif"
+        suffix_pattern = f"landsat_{month_string}_*.tif"
+
+        exact_matches = sorted(
+            self.landsat_dir.glob(exact_pattern)
+        )
+
+        if len(exact_matches) > 1:
+            raise RuntimeError(
+                f"Multiple Landsat files found for "
+                f"{year}-{month:02d}: {exact_matches}"
             )
 
-            if matches:
-                return matches[0]
+        if exact_matches:
+            return exact_matches[0]
+
+        suffix_matches = sorted(
+            self.landsat_dir.glob(suffix_pattern)
+        )
+
+        if len(suffix_matches) > 1:
+            raise RuntimeError(
+                f"Multiple Landsat files found for "
+                f"{year}-{month:02d}: {suffix_matches}. "
+                "There must be exactly one stacked Landsat "
+                "file per month."
+            )
+
+        if suffix_matches:
+            return suffix_matches[0]
 
         return None
 
     def discover_landsat_files(
         self,
-    ) -> Dict[
-        Tuple[int, int],
-        Dict[str, Path],
-    ]:
+        force_refresh: bool = False
+    ) -> Dict[Tuple[int, int], Path]:
         """
-        Discover complete Landsat monthly observations.
+        Discover complete monthly Landsat observations.
 
-        A month is considered available only when every configured Landsat band
-        is present.
+        Each observation must be a seven-band GeoTIFF.
 
-        Returns
-        -------
-        dict
-            Mapping:
-
-                (year, month)
-                    ->
-                {band_name: raster_path}
+        Returns:
+            {(year, month): stacked_landsat_path}
         """
-
-        if self._landsat_index is not None:
+        if (
+            self._landsat_index is not None
+            and not force_refresh
+        ):
             return self._landsat_index
 
-        if not self.landsat_dir.exists():
-            raise FileNotFoundError(
-                "Landsat directory does not exist: "
-                f"{self.landsat_dir}"
-            )
-
-        start_year, end_year = self.data_years
-
-        index: Dict[
-            Tuple[int, int],
-            Dict[str, Path],
-        ] = {}
+        index: Dict[Tuple[int, int], Path] = {}
 
         for year in range(
-            start_year,
-            end_year + 1,
+            self.data_start_year,
+            self.data_end_year + 1
         ):
             for month in range(1, 13):
-                band_paths: Dict[str, Path] = {}
-                complete = True
 
-                for band in self.landsat_bands:
-                    path = self._find_band_file(
-                        band=band,
-                        year=year,
-                        month=month,
-                    )
+                path = self._find_landsat_file(
+                    year,
+                    month
+                )
 
-                    if path is None:
-                        complete = False
-                        break
+                if path is None:
+                    continue
 
-                    band_paths[band] = path
+                try:
+                    with rasterio.open(path) as src:
 
-                if complete:
-                    index[(year, month)] = band_paths
+                        if src.count != EXPECTED_LANDSAT_BANDS:
+                            raise ValueError(
+                                f"Landsat file {path.name} contains "
+                                f"{src.count} bands; expected "
+                                f"{EXPECTED_LANDSAT_BANDS}."
+                            )
+
+                except rasterio.errors.RasterioIOError as exc:
+                    raise RuntimeError(
+                        f"Unable to open Landsat raster: {path}"
+                    ) from exc
+
+                index[(year, month)] = path
 
         self._landsat_index = index
+
         return index
 
-    def get_available_months(
-        self,
-    ) -> List[Tuple[int, int]]:
+    def get_available_months(self) -> List[Tuple[int, int]]:
         """
-        Return chronologically sorted complete Landsat observations.
+        Return all available complete Landsat observations
+        in chronological order.
         """
-
-        index = self.discover_landsat_files()
-
         return sorted(
-            index.keys(),
-            key=lambda item: (
-                item[0],
-                item[1],
-            ),
+            self.discover_landsat_files().keys()
         )
 
     def detect_missing_months(
         self,
+        start_year: Optional[int] = None,
+        end_year: Optional[int] = None
     ) -> List[Tuple[int, int]]:
         """
-        Detect months without complete Landsat observations.
+        Identify months for which no complete Landsat observation exists.
         """
-
-        available = set(
-            self.get_available_months()
+        start_year = (
+            self.data_start_year
+            if start_year is None
+            else int(start_year)
         )
 
-        start_year, end_year = self.data_years
+        end_year = (
+            self.data_end_year
+            if end_year is None
+            else int(end_year)
+        )
 
-        missing: List[Tuple[int, int]] = []
+        if start_year > end_year:
+            raise ValueError(
+                "start_year cannot be greater than end_year."
+            )
+
+        index = self.discover_landsat_files()
+
+        missing = []
 
         for year in range(
             start_year,
-            end_year + 1,
+            end_year + 1
         ):
             for month in range(1, 13):
-                key = (year, month)
-                if key not in available:
-                    missing.append(key)
+
+                if (year, month) not in index:
+                    missing.append(
+                        (year, month)
+                    )
 
         return missing
 
     def get_reference_path(self) -> Path:
         """
-        Select the raster used to define the common target grid.
+        Return the raster used to define the target grid.
 
-        The DEM is preferred because it is static and provides a consistent
-        spatial reference across the entire project.
+        The DEM is preferred. If the DEM is unavailable, the first
+        available stacked Landsat raster is used.
         """
-
         dem_path = self.static_dir / "dem.tif"
 
         if dem_path.exists():
             return dem_path
 
-        available_months = self.get_available_months()
+        index = self.discover_landsat_files()
 
-        if not available_months:
+        if not index:
             raise FileNotFoundError(
-                "Unable to determine a reference grid because no complete "
-                "Landsat observations or DEM were found."
+                "No DEM and no Landsat raster are available "
+                "to define the target grid."
             )
 
-        first_year, first_month = available_months[0]
-        index = self.discover_landsat_files()
-        first_band = self.landsat_bands[0]
+        first_key = sorted(
+            index.keys()
+        )[0]
 
-        return index[(first_year, first_month)][first_band]
+        return index[first_key]
 
-    def get_target_profile(self) -> Dict[str, Any]:
+    def get_target_profile(self) -> dict:
         """
-        Return the cached common target raster profile.
+        Return and cache the common target raster profile.
         """
-
         if self._target_profile is not None:
             return self._target_profile
 
         reference_path = self.get_reference_path()
 
-        with rasterio.open(reference_path) as source:
-            profile = {
-                "crs": source.crs,
-                "transform": source.transform,
-                "width": source.width,
-                "height": source.height,
+        with rasterio.open(reference_path) as src:
+
+            self._target_profile = {
+                "driver": "GTiff",
+                "dtype": "float32",
+                "width": src.width,
+                "height": src.height,
+                "count": 1,
+                "crs": src.crs,
+                "transform": src.transform,
+                "nodata": np.nan,
             }
 
-        if profile["crs"] is None:
-            raise ValueError(
-                "Reference raster has no CRS: "
-                f"{reference_path}"
-            )
-
-        self._target_profile = profile
-        return profile
+        return self._target_profile
 
     def _read_aligned(
         self,
-        raster_path: Path,
-        resampling: Resampling = Resampling.bilinear,
+        path: Path,
+        band_index: int = 1,
+        resampling: Resampling = Resampling.bilinear
     ) -> Tuple[np.ndarray, np.ndarray]:
         """
-        Read a raster and align it to the common target grid.
+        Read one raster band and align it to the common target grid.
 
-        NoData values are converted to NaN before reprojection.
+        Source NoData values are converted to NaN before reprojection.
 
-        Returns
-        -------
-        tuple
-            aligned_array
-                Raster values on the target grid.
-            valid_mask
-                Boolean mask indicating finite pixels.
+        Returns:
+            aligned_array: Float32 array on the target grid.
+            valid_mask: Boolean array indicating finite aligned pixels.
         """
+        target_profile = self.get_target_profile()
 
-        raster_path = Path(raster_path)
-
-        if not raster_path.exists():
-            raise FileNotFoundError(
-                f"Raster file not found: {raster_path}"
+        if band_index < 1:
+            raise ValueError(
+                f"Raster band index must be >= 1. "
+                f"Got {band_index}."
             )
 
-        target = self.get_target_profile()
+        with rasterio.open(path) as src:
 
-        with rasterio.open(raster_path) as source:
-            source_array = source.read(1).astype(np.float32)
-            source_nodata = source.nodata
+            if band_index > src.count:
+                raise ValueError(
+                    f"Requested band {band_index} from "
+                    f"{path.name}, but raster contains only "
+                    f"{src.count} bands."
+                )
+
+            source = src.read(
+                band_index
+            ).astype(np.float32)
+
+            source_nodata = src.nodata
 
             if source_nodata is not None:
-                source_array[source_array == source_nodata] = np.nan
+
+                source[
+                    np.isclose(
+                        source,
+                        source_nodata,
+                        equal_nan=False
+                    )
+                ] = np.nan
+
+            source[
+                ~np.isfinite(source)
+            ] = np.nan
 
             destination = np.full(
                 (
-                    target["height"],
-                    target["width"],
+                    target_profile["height"],
+                    target_profile["width"]
                 ),
                 np.nan,
-                dtype=np.float32,
+                dtype=np.float32
             )
 
-            if (
-                source.crs == target["crs"]
-                and source.transform == target["transform"]
-                and source.width == target["width"]
-                and source.height == target["height"]
-            ):
-                destination = source_array
-            else:
-                reproject(
-                    source=source_array,
-                    destination=destination,
-                    src_transform=source.transform,
-                    src_crs=source.crs,
-                    src_nodata=np.nan,
-                    dst_transform=target["transform"],
-                    dst_crs=target["crs"],
-                    dst_nodata=np.nan,
-                    resampling=resampling,
-                )
+            reproject(
+                source=source,
+                destination=destination,
+                src_transform=src.transform,
+                src_crs=src.crs,
+                dst_transform=target_profile["transform"],
+                dst_crs=target_profile["crs"],
+                src_nodata=np.nan,
+                dst_nodata=np.nan,
+                resampling=resampling
+            )
 
-        valid_mask = np.isfinite(destination)
+        valid_mask = np.isfinite(
+            destination
+        )
 
         return destination, valid_mask
 
     def load_landsat_month(
         self,
         year: int,
-        month: int,
-    ) -> np.ndarray:
+        month: int
+    ) -> Tuple[np.ndarray, np.ndarray]:
         """
-        Load all configured Landsat bands for one complete monthly observation.
+        Load a complete stacked Landsat observation.
 
-        Returns
-        -------
-        np.ndarray
-            Raster cube with shape: (number_of_bands, height, width)
+        Source GeoTIFF order:
+            1. Blue, 2. Green, 3. Red, 4. NIR, 5. SWIR1, 6. SWIR2, 7. Thermal
+
+        Returned model order:
+            1. Red, 2. Green, 3. Blue, 4. NIR, 5. SWIR1, 6. SWIR2, 7. Thermal
+
+        Returns:
+            bands: Array with shape (7, H, W).
+            valid_mask: Boolean array with shape (H, W), true only where
+                        all seven Landsat bands are valid.
         """
-
-        self._validate_month(year, month)
+        year, month = self._validate_year_month(
+            year,
+            month
+        )
 
         index = self.discover_landsat_files()
-        key = (int(year), int(month))
 
-        if key not in index:
+        path = index.get(
+            (year, month)
+        )
+
+        if path is None:
             raise FileNotFoundError(
-                "Complete Landsat observation is unavailable for "
-                f"{self._month_string(year, month)}."
+                f"No complete Landsat observation found "
+                f"for {year}-{month:02d}."
             )
 
-        aligned_bands: List[np.ndarray] = []
+        with rasterio.open(path) as src:
 
-        for band in self.landsat_bands:
-            band_path = index[key][band]
+            if src.count != EXPECTED_LANDSAT_BANDS:
+                raise ValueError(
+                    f"Landsat file {path.name} contains "
+                    f"{src.count} bands; expected "
+                    f"{EXPECTED_LANDSAT_BANDS}."
+                )
 
-            aligned_band, _ = self._read_aligned(
-                band_path,
-                resampling=Resampling.bilinear,
+        bands = []
+        valid_masks = []
+
+        for band_name in MODEL_BAND_ORDER:
+
+            source_band_index = (
+                SOURCE_TO_MODEL_INDEX[band_name]
             )
 
-            aligned_bands.append(aligned_band)
+            band, valid_mask = self._read_aligned(
+                path=path,
+                band_index=source_band_index,
+                resampling=Resampling.bilinear
+            )
 
-        return np.stack(aligned_bands, axis=0).astype(np.float32)
+            bands.append(band)
+            valid_masks.append(valid_mask)
 
-    def load_era5_predictor(
+        cube = np.stack(
+            bands,
+            axis=0
+        )
+
+        combined_valid_mask = np.logical_and.reduce(
+            valid_masks
+        )
+
+        cube[
+            :,
+            ~combined_valid_mask
+        ] = np.nan
+
+        return (
+            cube.astype(np.float32),
+            combined_valid_mask
+        )
+
+    def _find_nearest_month(
         self,
-        variable: str,
         year: int,
         month: int,
-    ) -> np.ndarray:
+        direction: int
+    ) -> Optional[Tuple[int, int]]:
         """
-        Load an ERA5 predictor aligned to the common target grid.
+        Find the nearest available Landsat observation before or after
+        the requested month.
 
-        Supported variables:
-            precip
-            temp
-
-        Expected filenames:
-            era5_precip_YYYY_MM.tif
-            era5_temp_YYYY_MM.tif
+        direction:
+            -1 = previous observation
+            +1 = next observation
         """
-
-        self._validate_month(year, month)
-        month_string = f"{int(month):02d}"
-        variable = variable.lower()
-
-        if variable == "precip":
-            raster_path = (
-                self.era5_precip_dir
-                / f"era5_precip_{year}_{month_string}.tif"
-            )
-        elif variable == "temp":
-            raster_path = (
-                self.era5_temp_dir
-                / f"era5_temp_{year}_{month_string}.tif"
-            )
-        else:
+        if direction not in (-1, 1):
             raise ValueError(
-                f"Unsupported ERA5 variable: {variable}. "
-                "Supported variables are 'precip' and 'temp'."
+                "direction must be either -1 or +1."
             )
 
-        aligned_array, _ = self._read_aligned(
-            raster_path,
-            resampling=Resampling.bilinear,
+        index = self.discover_landsat_files()
+
+        target_month_number = (
+            year * 12 + month
         )
 
-        return aligned_array
+        for distance in range(
+            1,
+            self.max_search_months + 1
+        ):
 
-    def load_static_dem(self) -> np.ndarray:
-        """
-        Load the static DEM aligned to the common target grid.
-        """
+            candidate_number = (
+                target_month_number
+                + direction * distance
+            )
 
-        dem_path = self.static_dir / "dem.tif"
+            candidate_year = (
+                candidate_number // 12
+            )
 
-        aligned_array, _ = self._read_aligned(
-            dem_path,
-            resampling=Resampling.bilinear,
-        )
+            candidate_month = (
+                candidate_number % 12
+            )
 
-        return aligned_array
+            if candidate_month == 0:
+                candidate_year -= 1
+                candidate_month = 12
 
-    def _month_distance(
-        self,
-        year_a: int,
-        month_a: int,
-        year_b: int,
-        month_b: int,
-    ) -> int:
-        """
-        Calculate absolute temporal distance between two months.
-        """
+            if (
+                candidate_year,
+                candidate_month
+            ) in index:
 
-        index_a = int(year_a) * 12 + int(month_a)
-        index_b = int(year_b) * 12 + int(month_b)
+                return (
+                    candidate_year,
+                    candidate_month
+                )
 
-        return abs(index_a - index_b)
-
-    def _find_previous_observation(
-        self,
-        year: int,
-        month: int,
-    ) -> Optional[Tuple[int, int]]:
-        """
-        Find the nearest complete Landsat observation before a target month.
-        """
-
-        available = self.get_available_months()
-        target_index = int(year) * 12 + int(month)
-        candidates = []
-
-        for obs_year, obs_month in available:
-            observation_index = obs_year * 12 + obs_month
-
-            if observation_index < target_index:
-                distance = target_index - observation_index
-
-                if distance <= self.max_search_months:
-                    candidates.append(
-                        (distance, obs_year, obs_month)
-                    )
-
-        if not candidates:
-            return None
-
-        candidates.sort(key=lambda item: item[0])
-        _, nearest_year, nearest_month = candidates[0]
-
-        return nearest_year, nearest_month
-
-    def _find_next_observation(
-        self,
-        year: int,
-        month: int,
-    ) -> Optional[Tuple[int, int]]:
-        """
-        Find the nearest complete Landsat observation after a target month.
-        """
-
-        available = self.get_available_months()
-        target_index = int(year) * 12 + int(month)
-        candidates = []
-
-        for obs_year, obs_month in available:
-            observation_index = obs_year * 12 + obs_month
-
-            if observation_index > target_index:
-                distance = observation_index - target_index
-
-                if distance <= self.max_search_months:
-                    candidates.append(
-                        (distance, obs_year, obs_month)
-                    )
-
-        if not candidates:
-            return None
-
-        candidates.sort(key=lambda item: item[0])
-        _, nearest_year, nearest_month = candidates[0]
-
-        return nearest_year, nearest_month
+        return None
 
     def load_temporal_neighbors(
         self,
         year: int,
-        month: int,
+        month: int
     ) -> Dict[str, Any]:
         """
-        Load the nearest previous and next complete Landsat observations.
+        Load the nearest previous and next Landsat observations.
 
-        This method is intended for the temporal-context gap-filling stage.
-
-        The returned dictionary contains:
+        The returned dictionary uses the feature names expected by
+        dataset.py:
             landsat_prev
             landsat_next
             dt_prev
             dt_next
-            prev_date
-            next_date
+            prev_available
+            next_available
+
+        Missing neighbours are represented by None and their
+        corresponding availability flag is set to 0.0.
         """
+        year, month = self._validate_year_month(
+            year,
+            month
+        )
 
-        self._validate_month(year, month)
+        previous_key = self._find_nearest_month(
+            year=year,
+            month=month,
+            direction=-1
+        )
 
-        previous = self._find_previous_observation(year, month)
-        next_observation = self._find_next_observation(year, month)
+        next_key = self._find_nearest_month(
+            year=year,
+            month=month,
+            direction=1
+        )
 
         previous_cube = None
         next_cube = None
-        dt_prev = None
-        dt_next = None
 
-        if previous is not None:
-            previous_year, previous_month = previous
-            previous_cube = self.load_landsat_month(
-                previous_year,
-                previous_month,
-            )
-            dt_prev = self._month_distance(
-                year,
-                month,
-                previous_year,
-                previous_month,
+        dt_prev = 0.0
+        dt_next = 0.0
+
+        prev_available = 0.0
+        next_available = 0.0
+
+        target_month_number = (
+            year * 12 + month
+        )
+
+        if previous_key is not None:
+
+            previous_cube, _ = (
+                self.load_landsat_month(
+                    previous_key[0],
+                    previous_key[1]
+                )
             )
 
-        if next_observation is not None:
-            next_year, next_month = next_observation
-            next_cube = self.load_landsat_month(
-                next_year,
-                next_month,
+            previous_month_number = (
+                previous_key[0] * 12
+                + previous_key[1]
             )
-            dt_next = self._month_distance(
-                year,
-                month,
-                next_year,
-                next_month,
+
+            dt_prev = float(
+                target_month_number
+                - previous_month_number
             )
+
+            prev_available = 1.0
+
+        if next_key is not None:
+
+            next_cube, _ = (
+                self.load_landsat_month(
+                    next_key[0],
+                    next_key[1]
+                )
+            )
+
+            next_month_number = (
+                next_key[0] * 12
+                + next_key[1]
+            )
+
+            dt_next = float(
+                next_month_number
+                - target_month_number
+            )
+
+            next_available = 1.0
 
         return {
             "landsat_prev": previous_cube,
             "landsat_next": next_cube,
             "dt_prev": dt_prev,
             "dt_next": dt_next,
-            "prev_date": previous,
-            "next_date": next_observation,
+            "prev_available": prev_available,
+            "next_available": next_available,
         }
+
+    def _load_single_predictor(
+        self,
+        path: Path,
+        resampling: Resampling = Resampling.bilinear
+    ) -> np.ndarray:
+        """
+        Load and spatially align a single-band predictor.
+        """
+        if not path.exists():
+            raise FileNotFoundError(
+                f"Predictor raster not found: {path}"
+            )
+
+        array, _ = self._read_aligned(
+            path=path,
+            band_index=1,
+            resampling=resampling
+        )
+
+        return array.astype(
+            np.float32
+        )
+
+    def load_era5_precip(
+        self,
+        year: int,
+        month: int
+    ) -> np.ndarray:
+        """
+        Load monthly ERA5 precipitation.
+        """
+        year, month = self._validate_year_month(
+            year,
+            month
+        )
+
+        path = (
+            self.era5_precip_dir
+            / f"era5_precip_{year}_{month:02d}.tif"
+        )
+
+        return self._load_single_predictor(
+            path
+        )
+
+    def load_era5_temp(
+        self,
+        year: int,
+        month: int
+    ) -> np.ndarray:
+        """
+        Load monthly ERA5 temperature.
+        """
+        year, month = self._validate_year_month(
+            year,
+            month
+        )
+
+        path = (
+            self.era5_temp_dir
+            / f"era5_temp_{year}_{month:02d}.tif"
+        )
+
+        return self._load_single_predictor(
+            path
+        )
+
+    def load_era5_predictor(
+        self,
+        predictor_type: str,
+        year: int,
+        month: int
+    ) -> np.ndarray:
+        """
+        Load an ERA5 predictor using the interface expected by dataset.py.
+
+        Supported predictor types:
+            precip
+            temp
+            temperature
+        """
+        predictor_type = str(
+            predictor_type
+        ).lower().strip()
+
+        if predictor_type == "precip":
+            return self.load_era5_precip(
+                year,
+                month
+            )
+
+        if predictor_type in (
+            "temp",
+            "temperature"
+        ):
+            return self.load_era5_temp(
+                year,
+                month
+            )
+
+        raise ValueError(
+            f"Unknown ERA5 predictor type: {predictor_type}. "
+            "Expected 'precip' or 'temp'."
+        )
+
+    def load_dem(self) -> np.ndarray:
+        """
+        Load and cache the static DEM.
+        """
+        if self._cached_dem is not None:
+            return self._cached_dem
+
+        path = self.static_dir / "dem.tif"
+
+        if not path.exists():
+            raise FileNotFoundError(
+                f"DEM raster not found: {path}"
+            )
+
+        dem = self._load_single_predictor(
+            path=path,
+            resampling=Resampling.bilinear
+        )
+
+        self._cached_dem = dem.astype(
+            np.float32
+        )
+
+        return self._cached_dem
+
+    def load_static_dem(self) -> np.ndarray:
+        """
+        Load the static DEM using the interface expected by dataset.py.
+        """
+        return self.load_dem()
 
     def load_avhrr_ndvi(
         self,
         year: int,
-        month: int,
+        month: int
     ) -> np.ndarray:
         """
-        Load AVHRR NDVI for independent gap-period evaluation.
+        Load AVHRR NDVI for independent evaluation.
 
-        Expected filename:
-            avhrr_ndvi_YYYY_MM.tif
+        AVHRR is evaluation-only and is never used as an RBFN predictor.
         """
+        year, month = self._validate_year_month(
+            year,
+            month
+        )
 
-        self._validate_month(year, month)
-
-        raster_path = (
+        path = (
             self.avhrr_dir
             / f"avhrr_ndvi_{year}_{month:02d}.tif"
         )
 
-        aligned_array, _ = self._read_aligned(
-            raster_path,
-            resampling=Resampling.bilinear,
+        return self._load_single_predictor(
+            path
         )
-
-        return aligned_array
 
     def load_modis_ndvi(
         self,
         year: int,
-        month: int,
+        month: int
     ) -> np.ndarray:
         """
         Load MODIS NDVI for independent evaluation.
-
-        Expected filename:
-            modis_ndvi_YYYY_MM.tif
         """
+        year, month = self._validate_year_month(
+            year,
+            month
+        )
 
-        self._validate_month(year, month)
-
-        raster_path = (
+        path = (
             self.modis_dir
             / f"modis_ndvi_{year}_{month:02d}.tif"
         )
 
-        aligned_array, _ = self._read_aligned(
-            raster_path,
-            resampling=Resampling.bilinear,
+        return self._load_single_predictor(
+            path
         )
-
-        return aligned_array

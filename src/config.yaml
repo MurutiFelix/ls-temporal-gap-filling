@@ -1,119 +1,139 @@
 # src/config.yaml
 
 project:
-  name: "Landsat Temporal Gap Filling"
-  seed: 42
+name: "Landsat Temporal Gap Filling"
+seed: 42
 
 paths:
-  data_dir: "data"
-  landsat_dir: "data/landsat"
-  avhrr_dir: "data/avhrr"
-  modis_dir: "data/modis"
-  static_dir: "data/static"
-  era5_precip_dir: "data/era5/precip"
-  era5_temp_dir: "data/era5/temp"
-  processed_dir: "data/processed"
-  eda_dir: "data/processed/eda"
-  logs: "src/logs"
-  outputs_dir: "outputs"
-  gapfilled_dir: "outputs/gapfilled"
-  evaluation_dir: "outputs/evaluation"
+data_dir: "data"
+landsat_dir: "data/landsat"
+avhrr_dir: "data/avhrr"
+modis_dir: "data/modis"
+static_dir: "data/static"
+era5_precip_dir: "data/era5/precip"
+era5_temp_dir: "data/era5/temp"
+processed_dir: "data/processed"
+eda_dir: "data/processed/eda"
+logs: "src/logs"
+outputs_dir: "outputs"
+gapfilled_dir: "outputs/gapfilled"
+evaluation_dir: "outputs/evaluation"
 
 landsat:
-  bands: ["Red", "Green", "Blue", "NIR", "SWIR1", "SWIR2", "Thermal"]
-  num_bands: 7
-  data_years: [1995, 2025]
-  training_years: [2000, 2025]
-  gap_years: [1995, 1999]
+bands:
+- "Red"
+- "Green"
+- "Blue"
+- "NIR"
+- "SWIR1"
+- "SWIR2"
+- "Thermal"
+
+num_bands: 7
+
+data_years: [1995, 2025]
+training_years: [2000, 2025]
+gap_years: [1995, 1999]
 
 features:
-  # Predictors forming the context-aware input vector X_t.
-  # Landsat_prev and Landsat_next provide the observed temporal context
-  # surrounding the target month, while dt_prev and dt_next encode the
-  # temporal distance from those observations.
-  inputs:
-    - "landsat_prev"
-    - "landsat_next"
-    - "dt_prev"
-    - "dt_next"
-    - "dem"
-    - "coord_x"
-    - "coord_y"
-    - "month_sin"
-    - "month_cos"
-    - "year_trend"
-    - "era5_precip"
-    - "era5_temp"
+inputs:
+- "landsat_prev"
+- "landsat_next"
+- "dt_prev"
+- "dt_next"
+- "prev_available"
+- "next_available"
+- "era5_precip"
+- "era5_temp"
+- "dem"
 
-  # These datasets are not model predictors. They are used only as
-  # independent reference data for evaluating reconstructed NDVI.
-  evaluation_only: ["avhrr_ndvi", "modis_ndvi"]
+evaluation_only:
+- "avhrr_ndvi"
+- "modis_ndvi"
 
 temporal_features:
-  month_cyclic:
-    enabled: true
-    period: 12
-
-  year_trend:
-    enabled: true
-    normalization: "training_period"
-
-  temporal_context:
-    enabled: true
-    previous_frame: "landsat_prev"
-    next_frame: "landsat_next"
-    previous_delta: "dt_prev"
-    next_delta: "dt_next"
-    max_search_months: 12
+temporal_context:
+enabled: true
+previous_frame: "landsat_prev"
+next_frame: "landsat_next"
+previous_delta: "dt_prev"
+next_delta: "dt_next"
+previous_availability: "prev_available"
+next_availability: "next_available"
+max_search_months: 12
 
 preprocessing:
-  feature_scaling: "standard"
-  target_scaling: "standard"
-  fit_scalers_on_training_only: true
-  spatial_alignment: true
-  temporal_alignment: true
+feature_scaling: "standard"
+target_scaling: "standard"
+fit_scalers_on_training_only: true
+spatial_alignment: true
+temporal_alignment: true
+nodata_handling: "nan"
+
+target_grid:
+reference: "dem"
+resolution: 30
 
 model:
-  rbfn:
-    num_centers: 50
-    gamma: null
-    regularization_lambda: 0.001
-    validation_holdout_ratio: 0.22
-    pixels_per_month: 50000
-    random_state: 42
+rbfn:
+num_centers: 50
+gamma: null
+gamma_multiplier: 1.0
+regularization_lambda: 0.001
+validation_holdout_ratio: 0.22
+test_holdout_ratio: 0.15
+pixels_per_month: 50000
+batch_size: 4096
+chunk_size: 8192
+num_workers: 0
+random_state: 42
 
 training:
-  target_mode: "per_band"
-  use_gap_period: false
-  prevent_gap_leakage: true
-  require_temporal_context: true
+target_mode: "per_band"
+use_gap_period: false
+prevent_gap_leakage: true
+require_temporal_context: true
+chronological_split: true
+shuffle_training: true
+shuffle_validation: false
+shuffle_test: false
+fit_centers_on_training_only: true
+fit_ridge_on_training_only: true
 
 gap_filling:
-  reconstruct_all_bands: true
-  derive_ndvi_after_reconstruction: true
-  use_temporal_context: true
+reconstruct_all_bands: true
+derive_ndvi_after_reconstruction: true
+use_temporal_context: true
+preserve_observed_pixels: true
+output_nodata: -9999
 
 evaluation:
-  enabled: true
+enabled: true
 
-  # AVHRR is available only during the Landsat gap period and is therefore
-  # reserved for independent evaluation rather than training.
-  avhrr:
-    enabled: true
-    variable: "avhrr_ndvi"
+avhrr:
+enabled: true
+variable: "avhrr_ndvi"
 
-  modis:
-    enabled: true
-    variable: "modis_ndvi"
+modis:
+enabled: true
+variable: "modis_ndvi"
 
-  metrics: ["pearson_r", "spearman_r", "rmse", "mae"]
+metrics:
+- "pearson_r"
+- "spearman_r"
+- "rmse"
+- "mae"
+
+evaluate_gap_period: true
 
 provenance:
-  enabled: true
-  observation_flag: true
+enabled: true
+observation_flag: true
+gapfilled_flag: true
+source_metadata: true
 
 eda:
-  enabled: true
-  correlation_analysis: true
-  temporal_analysis: true
-  spatial_analysis: true
+enabled: true
+correlation_analysis: true
+temporal_analysis: true
+spatial_analysis: true
