@@ -14,7 +14,7 @@
 ├── data/                              # ALL EXPERIMENT DATA MODALITIES
 │   ├── landsat/                        # Unprocessed Landsat data (R,G,B,NIR,SWIR1,SWIR2,Thermal layers)
 │   ├── avhrr/                          # avhrr ndvi for missing years
-│   ├── modis/                          # modis ndvi/ modis bands
+│   
 │   ├── static/                         # Landscape invariant -DEM
 │   ├── era5/ 
 │   │     ├── precip
