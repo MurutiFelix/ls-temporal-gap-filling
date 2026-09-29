@@ -345,7 +345,7 @@ class GapFillDataset:
         Y: np.ndarray,
     ) -> np.ndarray:
         """
-        Retain pixels with finite targets and environmental predictors.
+        Retain pixels where all target and feature values are strictly finite.
         """
         if X.ndim != 2 or Y.ndim != 2:
             raise ValueError("X and Y must both be 2-dimensional.")
@@ -359,18 +359,16 @@ class GapFillDataset:
         if Y.shape[1] != EXPECTED_OUT_FEATURES:
             raise ValueError(f"Y does not contain the expected {EXPECTED_OUT_FEATURES} targets.")
 
+        # Ensure all features in X and all targets in Y are fully finite (no NaN or Inf)
+        valid_features = np.all(np.isfinite(X), axis=1)
         valid_targets = np.all(np.isfinite(Y), axis=1)
-
-        valid_environment = np.all(
-            np.isfinite(X[:, list(ENVIRONMENTAL_FEATURE_INDICES)]),
-            axis=1,
-        )
 
         valid_temporal_flags = np.isin(
             X[:, PREV_AVAILABLE_INDEX], [0.0, 1.0]
         ) & np.isin(X[:, NEXT_AVAILABLE_INDEX], [0.0, 1.0])
 
-        return valid_targets & valid_environment & valid_temporal_flags
+        return valid_features & valid_targets & valid_temporal_flags
+           
 
     def _get_available_training_months(
         self,
