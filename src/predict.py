@@ -195,15 +195,13 @@ def load_model_and_scalers(
         weights_only=True,
     )
 
-    if "model_state_dict" not in checkpoint:
+    state_dict = checkpoint.get("state_dict") or checkpoint.get("model_state_dict")
+    if state_dict is None:
         raise KeyError(
-            "The model checkpoint does not contain "
-            "'model_state_dict'."
+            "The model checkpoint does not contain 'state_dict' or 'model_state_dict'."
         )
 
-    model.load_state_dict(
-        checkpoint["model_state_dict"]
-    )
+    model.load_state_dict(state_dict)
 
     model.eval()
 
