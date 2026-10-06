@@ -493,12 +493,12 @@ def build_inference_features(
 
     # 4. Environmental & spatial predictors
     precip = np.asarray(
-        processor.load_era5_predictor("precip"),
+        processor.load_era5_predictor("precip", year, month),
         dtype=np.float32,
     )
 
     temp = np.asarray(
-        processor.load_era5_predictor("temp"),
+        processor.load_era5_predictor("temp", year, month),
         dtype=np.float32,
     )
 
