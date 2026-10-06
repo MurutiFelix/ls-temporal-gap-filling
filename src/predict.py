@@ -200,6 +200,9 @@ def load_model_and_scalers(
         raise KeyError(
             "The model checkpoint does not contain 'state_dict' or 'model_state_dict'."
         )
+ 
+    if "centers" in state_dict:
+        model.centers = state_dict["centers"].to(model.centers.device)
 
     model.load_state_dict(state_dict)
 
