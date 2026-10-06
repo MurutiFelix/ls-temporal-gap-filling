@@ -247,7 +247,8 @@ def load_model_and_scalers(
         dtype=np.float32,
     )
 
-    validate_scalers(
+
+    x_mean, x_std, y_mean, y_std = validate_scalers(
         x_mean=x_mean,
         x_std=x_std,
         y_mean=y_mean,
@@ -265,9 +266,11 @@ def load_model_and_scalers(
             f"checkpoint: {binary_feature_indices}."
         )
 
+    # Make explicit copies of the sanitized 1D arrays
     x_mean = x_mean.copy()
     x_std = x_std.copy()
 
+    # Zero-out shift and unit-scale availability flag indices
     x_mean[PREV_AVAILABLE_INDEX] = 0.0
     x_mean[NEXT_AVAILABLE_INDEX] = 0.0
 
