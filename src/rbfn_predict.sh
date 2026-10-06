@@ -1,11 +1,11 @@
 #!/bin/bash
-#SBATCH --job-name=rbfn_predict
-#SBATCH --partition=gpu1
+#SBATCH --job-name=pred_dbg
+#SBATCH --partition=normal
 #SBATCH --nodes=1
 #SBATCH --ntasks-per-node=1
 #SBATCH --cpus-per-task=16
-#SBATCH --mem=64G
-#SBATCH --gres=gpu:1
+#SBATCH --mem=300000
+#SBATCH --gres=gpu:0
 #SBATCH --time=1-00:00:00
 #SBATCH --output=logs/rbfn_predict_%j.out
 #SBATCH --error=logs/rbfn_predict_%j.err

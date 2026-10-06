@@ -85,36 +85,33 @@ def validate_scalers(
     x_std: np.ndarray,
     y_mean: np.ndarray,
     y_std: np.ndarray,
-) -> None:
-    expected_x_shape = (
-        EXPECTED_IN_FEATURES,
-    )
-    expected_y_shape = (
-        EXPECTED_OUT_FEATURES,
-    )
+) -> tuple[np.ndarray, np.ndarray, np.ndarray, np.ndarray]:
+    x_mean = np.asarray(x_mean).ravel()
+    x_std = np.asarray(x_std).ravel()
+    y_mean = np.asarray(y_mean).ravel()
+    y_std = np.asarray(y_std).ravel()
+
+    expected_x_shape = (EXPECTED_IN_FEATURES,)
+    expected_y_shape = (EXPECTED_OUT_FEATURES,)
 
     if x_mean.shape != expected_x_shape:
         raise ValueError(
-            f"x_mean must have shape {expected_x_shape}, "
-            f"got {x_mean.shape}."
+            f"x_mean must have shape {expected_x_shape}, got {x_mean.shape}."
         )
 
     if x_std.shape != expected_x_shape:
         raise ValueError(
-            f"x_std must have shape {expected_x_shape}, "
-            f"got {x_std.shape}."
+            f"x_std must have shape {expected_x_shape}, got {x_std.shape}."
         )
 
     if y_mean.shape != expected_y_shape:
         raise ValueError(
-            f"y_mean must have shape {expected_y_shape}, "
-            f"got {y_mean.shape}."
+            f"y_mean must have shape {expected_y_shape}, got {y_mean.shape}."
         )
 
     if y_std.shape != expected_y_shape:
         raise ValueError(
-            f"y_std must have shape {expected_y_shape}, "
-            f"got {y_std.shape}."
+            f"y_std must have shape {expected_y_shape}, got {y_std.shape}."
         )
 
     arrays = {
@@ -126,19 +123,15 @@ def validate_scalers(
 
     for name, array in arrays.items():
         if not np.all(np.isfinite(array)):
-            raise ValueError(
-                f"{name} contains non-finite values."
-            )
+            raise ValueError(f"{name} contains non-finite values.")
 
     if np.any(x_std <= 0):
-        raise ValueError(
-            "x_std contains zero or negative values."
-        )
+        raise ValueError("x_std contains zero or negative values.")
 
     if np.any(y_std <= 0):
-        raise ValueError(
-            "y_std contains zero or negative values."
-        )
+        raise ValueError("y_std contains zero or negative values.")
+
+    return x_mean, x_std, y_mean, y_std
 
 
 def load_model_and_scalers(
