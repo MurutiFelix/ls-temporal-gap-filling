@@ -31,7 +31,7 @@ landsat:
     - "Thermal"
   data_years: [1995, 2025]
   training_years: [2000, 2025]
-  gap_years: [1995, 1999]
+  gap_years: [1995, 2024]
 
 features:
   inputs:
@@ -72,7 +72,7 @@ preprocessing:
 
 model:
   rbfn:
-    num_centers: 50
+    num_centers: 200
     gamma: null
     gamma_multiplier: 1.0
     regularization_lambda: 0.001
