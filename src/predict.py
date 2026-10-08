@@ -377,190 +377,51 @@ def validate_temporal_context(
     return prev_available, next_available
 
 
-def build_inference_features(
-    processor: RasterProcessor,
-    year: int,
-    month: int,
-    dem: np.ndarray,
-) -> Tuple[np.ndarray, np.ndarray]:
-    neighbors = processor.load_temporal_neighbors(
-        year,
-        month,
+def build_inference_features(processor, year, month, dem):
+    # 1. Derive spatial dimensions directly from the input DEM raster
+    H, W = dem.shape
+    spatial_shape = (H, W)
+
+    # 2. Load temporal neighbors
+    neighbors = processor.load_temporal_neighbors(year, month)
+    
+    prev_cube = neighbors.get("landsat_prev")
+    next_cube = neighbors.get("landsat_next")
+    
+    # 3. Derive per-pixel availability masks (True only where ALL 7 bands are finite)
+    has_prev = (
+        np.all(np.isfinite(prev_cube), axis=0) 
+        if prev_cube is not None 
+        else np.zeros(spatial_shape, dtype=bool)
+    )
+    has_next = (
+        np.all(np.isfinite(next_cube), axis=0) 
+        if next_cube is not None 
+        else np.zeros(spatial_shape, dtype=bool)
     )
 
-    prev_available, next_available = validate_temporal_context(
-        neighbors=neighbors,
-        year=year,
-        month=month,
-    )
+    # 4. Fill NaNs with zeros for missing neighbor bands prior to feature matrix assembly
+    prev_clean = np.nan_to_num(prev_cube, nan=0.0) if prev_cube is not None else np.zeros((7, H, W), dtype=np.float32)
+    next_clean = np.nan_to_num(next_cube, nan=0.0) if next_cube is not None else np.zeros((7, H, W), dtype=np.float32)
 
-    dem = np.asarray(
-        dem,
-        dtype=np.float32,
-    )
+    # 5. Construct feature matrix (N_pixels, 21)
+    X = np.zeros((H * W, 21), dtype=np.float32)
+    X[:, 0:7]   = prev_clean.reshape(7, -1).T
+    X[:, 7:14]  = next_clean.reshape(7, -1).T
+    X[:, 14]    = float(neighbors.get("dt_prev", 12.0))
+    X[:, 15]    = float(neighbors.get("dt_next", 12.0))
+    X[:, 16]    = has_prev.ravel().astype(np.float32)
+    X[:, 17]    = has_next.ravel().astype(np.float32)
+    
+    # 6. Load climate features and insert pre-loaded DEM
+    X[:, 18]    = processor.load_era5_predictor("precip", year, month).ravel()
+    X[:, 19]    = processor.load_era5_predictor("temp", year, month).ravel()
+    X[:, 20]    = dem.ravel()
 
-    if dem.ndim != 2:
-        raise ValueError(
-            "DEM must be a 2D raster. "
-            f"Got {dem.shape}."
-        )
+    # 7. Valid mask requires environmental features and DEM to be fully finite
+    valid_mask = np.all(np.isfinite(X[:, 18:21]), axis=1)
 
-    height, width = dem.shape
-    num_pixels = height * width
-
-    X = np.zeros(
-        (
-            num_pixels,
-            EXPECTED_IN_FEATURES,
-        ),
-        dtype=np.float32,
-    )
-
-    # 1. Previous temporal context
-    if prev_available == 1:
-        landsat_prev = np.asarray(
-            neighbors["landsat_prev"],
-            dtype=np.float32,
-        )
-
-        previous_matrix = flatten_raster_features(
-            landsat_prev
-        )
-
-        if previous_matrix.shape[0] != num_pixels:
-            raise ValueError(
-                "Previous Landsat observation does not match "
-                "the target grid."
-            )
-
-        X[
-            :,
-            PREVIOUS_BAND_START:PREVIOUS_BAND_END,
-        ] = previous_matrix
-
-        X[:, DT_PREV_INDEX] = np.float32(
-            neighbors["dt_prev"]
-        )
-    else:
-        X[
-            :,
-            PREVIOUS_BAND_START:PREVIOUS_BAND_END,
-        ] = 0.0
-
-        X[:, DT_PREV_INDEX] = 0.0
-
-    # 2. Next temporal context
-    if next_available == 1:
-        landsat_next = np.asarray(
-            neighbors["landsat_next"],
-            dtype=np.float32,
-        )
-
-        next_matrix = flatten_raster_features(
-            landsat_next
-        )
-
-        if next_matrix.shape[0] != num_pixels:
-            raise ValueError(
-                "Next Landsat observation does not match "
-                "the target grid."
-            )
-
-        X[
-            :,
-            NEXT_BAND_START:NEXT_BAND_END,
-        ] = next_matrix
-
-        X[:, DT_NEXT_INDEX] = np.float32(
-            neighbors["dt_next"]
-        )
-    else:
-        X[
-            :,
-            NEXT_BAND_START:NEXT_BAND_END,
-        ] = 0.0
-
-        X[:, DT_NEXT_INDEX] = 0.0
-
-    # 3. Availability flags
-    X[:, PREV_AVAILABLE_INDEX] = np.float32(
-        prev_available
-    )
-
-    X[:, NEXT_AVAILABLE_INDEX] = np.float32(
-        next_available
-    )
-
-    # 4. Environmental & spatial predictors
-    precip = np.asarray(
-        processor.load_era5_predictor("precip", year, month),
-        dtype=np.float32,
-    )
-
-    temp = np.asarray(
-        processor.load_era5_predictor("temp", year, month),
-        dtype=np.float32,
-    )
-
-    if precip.ndim != 2:
-        raise ValueError(
-            "ERA5 precipitation must be a 2D raster. "
-            f"Got {precip.shape}."
-        )
-
-    if temp.ndim != 2:
-        raise ValueError(
-            "ERA5 temperature must be a 2D raster. "
-            f"Got {temp.shape}."
-        )
-
-    if precip.shape != dem.shape:
-        raise ValueError(
-            "ERA5 precipitation does not match the target grid. "
-            f"Expected {dem.shape}, got {precip.shape}."
-        )
-
-    if temp.shape != dem.shape:
-        raise ValueError(
-            "ERA5 temperature does not match the target grid. "
-            f"Expected {dem.shape}, got {temp.shape}."
-        )
-
-    X[:, ERA5_PRECIP_INDEX] = precip.reshape(
-        -1
-    )
-
-    X[:, ERA5_TEMP_INDEX] = temp.reshape(
-        -1
-    )
-
-    X[:, DEM_INDEX] = dem.reshape(
-        -1
-    )
-
-    # Filter out non-finite pixels (e.g. background/nodata pixels in DEM or ERA5)
-    valid_mask = np.all(
-        np.isfinite(X),
-        axis=1,
-    )
-
-    valid_mask &= np.isin(
-        X[:, PREV_AVAILABLE_INDEX],
-        [0.0, 1.0],
-    )
-
-    valid_mask &= np.isin(
-        X[:, NEXT_AVAILABLE_INDEX],
-        [0.0, 1.0],
-    )
-
-    return (
-        np.ascontiguousarray(
-            X,
-            dtype=np.float32,
-        ),
-        valid_mask,
-    )
+    return X, valid_mask, has_prev, has_next
 
 
 def predict_in_chunks(
@@ -801,7 +662,8 @@ def process_gap_month(
     output_nodata: float,
 ) -> bool:
     try:
-        X_raw, valid_mask = build_inference_features(
+        # 1. Unpack features AND per-pixel neighbor masks
+        X_raw, valid_mask, has_prev, has_next = build_inference_features(
             processor=processor,
             year=year,
             month=month,
@@ -812,72 +674,65 @@ def process_gap_month(
         ValueError,
         FileNotFoundError,
     ) as exc:
-        print(
-            f"Skipping {year}-{month:02d}: {exc}"
-        )
-
+        print(f"Skipping {year}-{month:02d}: {exc}")
         return False
-
-    prediction_scaled = np.full(
-        (
-            X_raw.shape[0],
-            EXPECTED_OUT_FEATURES,
-        ),
-        np.nan,
-        dtype=np.float32,
-    )
 
     if not np.any(valid_mask):
         print(
             f"Skipping {year}-{month:02d}: "
             "no valid inference pixels."
         )
-
         return False
 
-    X_valid = X_raw[
-        valid_mask
-    ]
+    # 2. Identify pixels with AT LEAST ONE neighbor vs. ZERO neighbors
+    has_prev_flat = has_prev.ravel()
+    has_next_flat = has_next.ravel()
+    
+    # Model prediction mask (valid environmental predictors AND at least one neighbor)
+    pred_mask = valid_mask & (has_prev_flat | has_next_flat)
+    
+    # Fallback mask (valid environmental predictors BUT no neighbors available)
+    fallback_mask = valid_mask & ~(has_prev_flat | has_next_flat)
 
-    X_scaled = (
-        X_valid
-        - x_mean
-    ) / x_std
-
-    X_scaled = np.ascontiguousarray(
-        X_scaled,
+    # 3. Predict via RBFN for pred_mask pixels
+    prediction_scaled = np.full(
+        (X_raw.shape[0], EXPECTED_OUT_FEATURES),
+        np.nan,
         dtype=np.float32,
     )
 
-    prediction_scaled[
-        valid_mask
-    ] = predict_in_chunks(
-        model=model,
-        X=X_scaled,
-        chunk_size=chunk_size,
-    )
+    if np.any(pred_mask):
+        X_valid = X_raw[pred_mask]
+        X_scaled = (X_valid - x_mean) / x_std
+        X_scaled = np.ascontiguousarray(X_scaled, dtype=np.float32)
 
+        prediction_scaled[pred_mask] = predict_in_chunks(
+            model=model,
+            X=X_scaled,
+            chunk_size=chunk_size,
+        )
+
+    # 4. Unscale predictions back to physical surface reflectance
     prediction_physical = np.full(
         prediction_scaled.shape,
         np.nan,
         dtype=np.float32,
     )
 
-    prediction_physical[
-        valid_mask
-    ] = (
-        prediction_scaled[
-            valid_mask
-        ] * y_std
-    ) + y_mean
+    if np.any(pred_mask):
+        prediction_physical[pred_mask] = (
+            prediction_scaled[pred_mask] * y_std
+        ) + y_mean
 
-    height = int(
-        target_profile["height"]
-    )
+    # -----------------------------------------------------------------
+    # FALLBACK ASSIGNMENT: Fill zero-neighbor pixels with dataset means
+    # -----------------------------------------------------------------
+    if np.any(fallback_mask):
+        prediction_physical[fallback_mask] = y_mean
 
-    width = int(
-        target_profile["width"]
-    )
+    # 5. Reconstruct 3D GeoTIFF raster cube and calculate derived products
+    height = int(target_profile["height"])
+    width = int(target_profile["width"])
 
     reconstructed_cube = reconstruct_raster(
         prediction_physical=prediction_physical,
@@ -885,9 +740,7 @@ def process_gap_month(
         width=width,
     )
 
-    ndvi = derive_ndvi(
-        reconstructed_cube
-    )
+    ndvi = derive_ndvi(reconstructed_cube)
 
     band_output_path = (
         output_dir
@@ -913,13 +766,8 @@ def process_gap_month(
         nodata=output_nodata,
     )
 
-    print(
-        f"Saved bands: {band_output_path}"
-    )
-
-    print(
-        f"Saved NDVI: {ndvi_output_path}"
-    )
+    print(f"Saved bands: {band_output_path}")
+    print(f"Saved NDVI: {ndvi_output_path}")
 
     return True
 
