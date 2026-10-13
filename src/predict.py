@@ -81,9 +81,24 @@ def find_and_load_target_scene(data_dir: Path, year: int, month: int, target_pro
                         resampling=Resampling.nearest
                     )
                 
+                destination = reorder_gee_to_config_bands(destination)
+                
                 return destination, tif_path
                 
     return None, None
+
+def reorder_gee_to_config_bands(data: np.ndarray) -> np.ndarray:
+    """
+    Reorders bands from GEE export order [Blue, Green, Red, NIR, SWIR1, SWIR2, Thermal]
+    to model config order [Red, Green, Blue, NIR, SWIR1, SWIR2, Thermal].
+    """
+    if data is None or data.ndim != 3 or data.shape[0] < 7:
+        return data
+
+    # GEE indices: 0:Blue, 1:Green, 2:Red, 3:NIR, 4:SWIR1, 5:SWIR2, 6:Thermal
+    # Target order: Red (2), Green (1), Blue (0), NIR (3), SWIR1 (4), SWIR2 (5), Thermal (6)
+    gee_to_config = [2, 1, 0, 3, 4, 5, 6]
+    return data[gee_to_config, :, :]
 
 def get_aoi_mask(target_profile: dict) -> np.ndarray:
     """Rasterizes the catchment shapefile to create a boolean mask (True inside AOI)."""
@@ -439,14 +454,13 @@ def validate_temporal_context(
 
     return prev_available, next_available
 
-
 def build_inference_features(processor, year, month, dem, aoi_mask):
     H, W = dem.shape
     spatial_shape = (H, W)
 
     neighbors = processor.load_temporal_neighbors(year, month)
-    prev_cube = neighbors.get("landsat_prev")
-    next_cube = neighbors.get("landsat_next")
+    prev_cube = reorder_gee_to_config_bands(neighbors.get("landsat_prev"))
+    next_cube = reorder_gee_to_config_bands(neighbors.get("landsat_next"))
 
     # Relaxed per-pixel availability: True where at least one band is valid and > 0
     has_prev = (
@@ -746,9 +760,9 @@ def process_gap_month(
 
     print(f"[{year}-{month:02d}] Calculated AOI Coverage: {coverage_pct:.2f}%")
 
-    # RULE: If coverage >= 99.5%, the scene is completely clean. Skip processing!
-    if coverage_pct >= 99.5:
-        print(f"[{year}-{month:02d}] Scene is fully clean ({coverage_pct:.2f}%). Skipping gap-filling.")
+   
+    if coverage_pct >= threshold_pct:
+        print(f"[{year}-{month:02d}] AOI Coverage ({coverage_pct:.2f}%) >= Threshold ({threshold_pct}%). Skipping gap-filling.")
         return False
 
     # 3. Build features for gap filling
