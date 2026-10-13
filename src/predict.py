@@ -25,6 +25,7 @@ from models.rbfn import RBFN
 from preprocessing.raster_processor import RasterProcessor
 import geopandas as gpd
 from rasterio.features import rasterize
+from rasterio.warp import reproject, Resampling
 
 EXPECTED_IN_FEATURES = 21
 EXPECTED_OUT_FEATURES = 7
@@ -46,12 +47,10 @@ BINARY_FEATURE_INDICES = (
     NEXT_AVAILABLE_INDEX,
 )
 
-def find_and_load_target_scene(data_dir: Path, year: int, month: int) -> Tuple[np.ndarray, Path]:
+def find_and_load_target_scene(data_dir: Path, year: int, month: int, target_profile: dict) -> Tuple[np.ndarray, Path]:
     """
-    Directly scans the Landsat directory for a GeoTIFF matching the target year and month,
-    loads its raster data, and returns the cube and path.
+    Scans data_dir for the target scene and resamples/reprojects it to match target_profile grid.
     """
-    # Search for files containing _YYYY_MM_ or YYYY_MM or landsat_YYYY_MM
     pattern_str_1 = f"_{year}_{month:02d}"
     pattern_str_2 = f"_{year}_{month}"
     
@@ -61,8 +60,28 @@ def find_and_load_target_scene(data_dir: Path, year: int, month: int) -> Tuple[n
         stem = tif_path.stem
         if pattern_str_1 in stem or pattern_str_2 in stem:
             with rasterio.open(tif_path) as src:
-                data = src.read().astype(np.float32)
-                return data, tif_path
+                # Target dimensions & transform from target_profile
+                out_height = target_profile["height"]
+                out_width = target_profile["width"]
+                out_crs = target_profile["crs"]
+                out_transform = target_profile["transform"]
+                
+                # Destination array matching exact target profile dimensions
+                destination = np.zeros((src.count, out_height, out_width), dtype=np.float32)
+
+                # Reproject / align grid dimensions
+                for band_idx in range(1, src.count + 1):
+                    reproject(
+                        source=rasterio.band(src, band_idx),
+                        destination=destination[band_idx - 1],
+                        src_transform=src.transform,
+                        src_crs=src.crs,
+                        dst_transform=out_transform,
+                        dst_crs=out_crs,
+                        resampling=Resampling.nearest
+                    )
+                
+                return destination, tif_path
                 
     return None, None
 
@@ -707,8 +726,8 @@ def process_gap_month(
 
     # 2. DIRECT DISK LOAD: Locate target scene in data/landsat
     landsat_dir = Path(__file__).resolve().parents[1] / "data" / "landsat"
-    target_cube, scene_path = find_and_load_target_scene(landsat_dir, year, month)
-
+    target_cube, scene_path = find_and_load_target_scene(landsat_dir, year, month, target_profile)
+    
     target_flat = None
     real_obs_mask = np.zeros(aoi_mask_flat.shape, dtype=bool)
 
