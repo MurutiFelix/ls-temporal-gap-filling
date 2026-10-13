@@ -23,6 +23,8 @@ import torch
 import yaml
 from models.rbfn import RBFN
 from preprocessing.raster_processor import RasterProcessor
+import geopandas as gpd
+from rasterio.features import rasterize
 
 EXPECTED_IN_FEATURES = 21
 EXPECTED_OUT_FEATURES = 7
@@ -44,6 +46,28 @@ BINARY_FEATURE_INDICES = (
     NEXT_AVAILABLE_INDEX,
 )
 
+def get_aoi_mask(target_profile: dict) -> np.ndarray:
+    """Rasterizes the catchment shapefile to create a boolean mask (True inside AOI)."""
+    shp_path = Path("Delineated_Watershade_final_ExportFeatures.shp")
+    if not shp_path.exists():
+        found = list(Path(".").rglob("*.shp"))
+        if found:
+            shp_path = found[0]
+        else:
+            raise FileNotFoundError("AOI Shapefile not found in project workspace.")
+
+    aoi_gdf = gpd.read_file(shp_path)
+    
+    # Rasterize shapefile directly onto target profile grid
+    aoi_mask = rasterize(
+        shapes=[(geom, 1) for geom in aoi_gdf.geometry],
+        out_shape=(target_profile["height"], target_profile["width"]),
+        transform=target_profile["transform"],
+        fill=0,
+        dtype=np.uint8,
+    ) == 1
+
+    return aoi_mask
 
 def load_config(config_path: Path) -> Dict:
     with config_path.open("r", encoding="utf-8") as file:
@@ -377,24 +401,23 @@ def validate_temporal_context(
     return prev_available, next_available
 
 
-def build_inference_features(processor, year, month, dem):
+def build_inference_features(processor, year, month, dem, aoi_mask):
     H, W = dem.shape
     spatial_shape = (H, W)
 
     neighbors = processor.load_temporal_neighbors(year, month)
-    
     prev_cube = neighbors.get("landsat_prev")
     next_cube = neighbors.get("landsat_next")
-    
-    # Per-pixel check: True where neighbor pixels are actually finite and non-zero
+
+    # Relaxed per-pixel availability: True where at least one band is valid and > 0
     has_prev = (
-        np.all(np.isfinite(prev_cube) & (prev_cube > 0), axis=0) 
-        if prev_cube is not None 
+        np.any(np.isfinite(prev_cube) & (prev_cube > 0), axis=0)
+        if prev_cube is not None
         else np.zeros(spatial_shape, dtype=bool)
     )
     has_next = (
-        np.all(np.isfinite(next_cube) & (next_cube > 0), axis=0) 
-        if next_cube is not None 
+        np.any(np.isfinite(next_cube) & (next_cube > 0), axis=0)
+        if next_cube is not None
         else np.zeros(spatial_shape, dtype=bool)
     )
 
@@ -413,8 +436,9 @@ def build_inference_features(processor, year, month, dem):
     X[:, 19]    = processor.load_era5_predictor("temp", year, month).ravel()
     X[:, 20]    = dem.ravel()
 
-    # Environmental predictors valid mask
-    valid_mask = np.all(np.isfinite(X[:, 18:21]), axis=1)
+    # Valid mask requires pixels to be strictly INSIDE the AOI and have valid environmental predictors
+    aoi_mask_flat = aoi_mask.ravel()
+    valid_mask = aoi_mask_flat & np.all(np.isfinite(X[:, 18:21]), axis=1)
 
     return X, valid_mask, has_prev, has_next
 
@@ -655,34 +679,50 @@ def process_gap_month(
     month: int,
     chunk_size: int,
     output_nodata: float,
+    threshold_pct: float = 80.0,
 ) -> bool:
+    # 1. Build spatial AOI boundary mask
+    aoi_mask = get_aoi_mask(target_profile)
+    aoi_mask_flat = aoi_mask.ravel()
+
     try:
         X_raw, valid_mask, has_prev, has_next = build_inference_features(
             processor=processor,
             year=year,
             month=month,
             dem=dem,
+            aoi_mask=aoi_mask,
         )
     except (KeyError, ValueError, FileNotFoundError) as exc:
         print(f"Skipping {year}-{month:02d}: {exc}")
         return False
 
-    if not np.any(valid_mask):
-        print(f"Skipping {year}-{month:02d}: no valid inference pixels.")
-        return False
+    # 2. Inspect real target scene if present on disk
+    target_cube = None
+    try:
+        target_cube = processor.load_landsat(year, month)
+    except Exception:
+        target_cube = None
 
-    # 1. Load target image if present to preserve real observations
-    target_cube = processor.load_target_month(year, month) if hasattr(processor, "load_target_month") else None
-    
     target_flat = None
     real_obs_mask = np.zeros(X_raw.shape[0], dtype=bool)
 
     if target_cube is not None:
         target_flat = flatten_raster_features(target_cube)
-        # Real ground truth pixels (finite and > 0)
-        real_obs_mask = np.all(np.isfinite(target_flat) & (target_flat > 0), axis=1)
+        # Ground truth pixels strictly inside AOI boundary with valid reflectance
+        real_obs_mask = aoi_mask_flat & np.all(np.isfinite(target_flat) & (target_flat > 0), axis=1)
 
-    # 2. Identify missing pixels that actually require gap filling
+    total_aoi_pixels = np.sum(aoi_mask_flat)
+    valid_aoi_pixels = np.sum(real_obs_mask)
+    coverage_pct = (valid_aoi_pixels / max(total_aoi_pixels, 1)) * 100.0
+
+    print(f"\n[{year}-{month:02d}] Exact AOI Coverage: {coverage_pct:.2f}%")
+
+    # RULE 1: If coverage >= 80%, scene is sufficient. Preserve image as-is, fill gaps only if needed
+    if coverage_pct >= threshold_pct:
+        print(f"[{year}-{month:02d}] Scene coverage >= 80%. Retaining ground truth and filling missing gaps only.")
+
+    # RULE 2: Identify missing gap pixels within the AOI boundary
     gap_pixels_mask = valid_mask & (~real_obs_mask)
 
     has_prev_flat = has_prev.ravel()
@@ -691,12 +731,12 @@ def process_gap_month(
     # Model inference mask: gap pixels that have at least one temporal neighbor
     pred_mask = gap_pixels_mask & (has_prev_flat | has_next_flat)
     
-    # Isolated fallback mask: gap pixels with zero temporal neighbors
+    # Fallback mask: gap pixels with zero temporal neighbors (use neighbor interpolation/nearest clean pixel rather than flat y_mean)
     fallback_mask = gap_pixels_mask & ~(has_prev_flat | has_next_flat)
 
-    print(f"[{year}-{month:02d}] Real Ground Truth Retained: {np.sum(real_obs_mask):,}")
-    print(f"[{year}-{month:02d}] Gap Pixels RBFN Filled: {np.sum(pred_mask):,}")
-    print(f"[{year}-{month:02d}] Isolated Gap Pixels Fallback: {np.sum(fallback_mask):,}")
+    print(f"[{year}-{month:02d}] Retained Ground Truth Pixels: {valid_aoi_pixels:,}")
+    print(f"[{year}-{month:02d}] Gap Pixels Predicted via RBFN: {np.sum(pred_mask):,}")
+    print(f"[{year}-{month:02d}] Isolated Gap Pixels (Temporal Fallback): {np.sum(fallback_mask):,}")
 
     prediction_physical = np.full(
         (X_raw.shape[0], EXPECTED_OUT_FEATURES),
@@ -705,10 +745,10 @@ def process_gap_month(
     )
 
     # A. PRESERVE GROUND TRUTH FIRST
-    if np.any(real_obs_mask) and target_flat is not None:
+    if valid_aoi_pixels > 0 and target_flat is not None:
         prediction_physical[real_obs_mask] = target_flat[real_obs_mask]
 
-    # B. RBFN PREDICTION FOR GAPS
+    # B. RBFN PREDICTION FOR ACTUAL MISSING GAPS ONLY
     if np.any(pred_mask):
         X_valid = X_raw[pred_mask]
         X_scaled = (X_valid - x_mean) / x_std
@@ -720,11 +760,22 @@ def process_gap_month(
             chunk_size=chunk_size,
         )
 
+        # Unscale model predictions back to physical surface reflectance range
         prediction_physical[pred_mask] = (prediction_scaled * y_std) + y_mean
 
-    # C. FALLBACK FOR ISOLATED GAPS
+    # C. FALLBACK FOR ISOLATED GAPS WITHOUT TEMPORAL NEIGHBORS
+    # Fill isolated gaps using temporal neighbor means or physical dataset medians
     if np.any(fallback_mask):
-        prediction_physical[fallback_mask] = y_mean
+        # Use available temporal neighbor surface reflectance where available
+        prev_flat = X_raw[:, 0:7]
+        next_flat = X_raw[:, 7:14]
+        
+        neighbor_avg = np.where(prev_flat > 0, prev_flat, next_flat)
+        fallback_vals = np.where(neighbor_avg > 0, neighbor_avg, y_mean)
+        prediction_physical[fallback_mask] = fallback_vals[fallback_mask]
+
+    # Mask out background area outside the AOI shapefile as NaN / NoData
+    prediction_physical[~aoi_mask_flat] = np.nan
 
     # Reconstruct 3D GeoTIFF raster cube
     height = int(target_profile["height"])
@@ -755,8 +806,8 @@ def process_gap_month(
         nodata=output_nodata,
     )
 
-    print(f"Saved bands: {band_output_path}")
-    print(f"Saved NDVI: {ndvi_output_path}")
+    print(f"Saved band output: {band_output_path}")
+    print(f"Saved NDVI output: {ndvi_output_path}")
 
     return True
 
