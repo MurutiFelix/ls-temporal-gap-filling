@@ -378,33 +378,29 @@ def validate_temporal_context(
 
 
 def build_inference_features(processor, year, month, dem):
-    # 1. Derive spatial dimensions directly from the input DEM raster
     H, W = dem.shape
     spatial_shape = (H, W)
 
-    # 2. Load temporal neighbors
     neighbors = processor.load_temporal_neighbors(year, month)
     
     prev_cube = neighbors.get("landsat_prev")
     next_cube = neighbors.get("landsat_next")
     
-    # 3. Derive per-pixel availability masks (True only where ALL 7 bands are finite)
+    # Per-pixel check: True where neighbor pixels are actually finite and non-zero
     has_prev = (
-        np.all(np.isfinite(prev_cube), axis=0) 
+        np.all(np.isfinite(prev_cube) & (prev_cube > 0), axis=0) 
         if prev_cube is not None 
         else np.zeros(spatial_shape, dtype=bool)
     )
     has_next = (
-        np.all(np.isfinite(next_cube), axis=0) 
+        np.all(np.isfinite(next_cube) & (next_cube > 0), axis=0) 
         if next_cube is not None 
         else np.zeros(spatial_shape, dtype=bool)
     )
 
-    # 4. Fill NaNs with zeros for missing neighbor bands prior to feature matrix assembly
     prev_clean = np.nan_to_num(prev_cube, nan=0.0) if prev_cube is not None else np.zeros((7, H, W), dtype=np.float32)
     next_clean = np.nan_to_num(next_cube, nan=0.0) if next_cube is not None else np.zeros((7, H, W), dtype=np.float32)
 
-    # 5. Construct feature matrix (N_pixels, 21)
     X = np.zeros((H * W, 21), dtype=np.float32)
     X[:, 0:7]   = prev_clean.reshape(7, -1).T
     X[:, 7:14]  = next_clean.reshape(7, -1).T
@@ -413,12 +409,11 @@ def build_inference_features(processor, year, month, dem):
     X[:, 16]    = has_prev.ravel().astype(np.float32)
     X[:, 17]    = has_next.ravel().astype(np.float32)
     
-    # 6. Load climate features and insert pre-loaded DEM
     X[:, 18]    = processor.load_era5_predictor("precip", year, month).ravel()
     X[:, 19]    = processor.load_era5_predictor("temp", year, month).ravel()
     X[:, 20]    = dem.ravel()
 
-    # 7. Valid mask requires environmental features and DEM to be fully finite
+    # Environmental predictors valid mask
     valid_mask = np.all(np.isfinite(X[:, 18:21]), axis=1)
 
     return X, valid_mask, has_prev, has_next
@@ -660,97 +655,78 @@ def process_gap_month(
     month: int,
     chunk_size: int,
     output_nodata: float,
-    coverage_threshold: float = 0.80,
 ) -> bool:
     try:
-        # 1. Unpack features AND per-pixel neighbor masks
         X_raw, valid_mask, has_prev, has_next = build_inference_features(
             processor=processor,
             year=year,
             month=month,
             dem=dem,
         )
-    except (
-        KeyError,
-        ValueError,
-        FileNotFoundError,
-    ) as exc:
+    except (KeyError, ValueError, FileNotFoundError) as exc:
         print(f"Skipping {year}-{month:02d}: {exc}")
         return False
 
     if not np.any(valid_mask):
-        print(
-            f"Skipping {year}-{month:02d}: "
-            "no valid inference pixels."
-        )
+        print(f"Skipping {year}-{month:02d}: no valid inference pixels.")
         return False
 
-    # 2. Identify pixels with AT LEAST ONE neighbor vs. ZERO neighbors
+    # 1. Load target image if present to preserve real observations
+    target_cube = processor.load_target_month(year, month) if hasattr(processor, "load_target_month") else None
+    
+    target_flat = None
+    real_obs_mask = np.zeros(X_raw.shape[0], dtype=bool)
+
+    if target_cube is not None:
+        target_flat = flatten_raster_features(target_cube)
+        # Real ground truth pixels (finite and > 0)
+        real_obs_mask = np.all(np.isfinite(target_flat) & (target_flat > 0), axis=1)
+
+    # 2. Identify missing pixels that actually require gap filling
+    gap_pixels_mask = valid_mask & (~real_obs_mask)
+
     has_prev_flat = has_prev.ravel()
     has_next_flat = has_next.ravel()
+
+    # Model inference mask: gap pixels that have at least one temporal neighbor
+    pred_mask = gap_pixels_mask & (has_prev_flat | has_next_flat)
     
-    pred_mask = valid_mask & (has_prev_flat | has_next_flat)
-    fallback_mask = valid_mask & ~(has_prev_flat | has_next_flat)
+    # Isolated fallback mask: gap pixels with zero temporal neighbors
+    fallback_mask = gap_pixels_mask & ~(has_prev_flat | has_next_flat)
 
-    print(f"[{year}-{month:02d}] RBFN Inference Pixels: {np.sum(pred_mask):,}")
-    print(f"[{year}-{month:02d}] Global Fallback Pixels: {np.sum(fallback_mask):,}")
+    print(f"[{year}-{month:02d}] Real Ground Truth Retained: {np.sum(real_obs_mask):,}")
+    print(f"[{year}-{month:02d}] Gap Pixels RBFN Filled: {np.sum(pred_mask):,}")
+    print(f"[{year}-{month:02d}] Isolated Gap Pixels Fallback: {np.sum(fallback_mask):,}")
 
-    # 3. Predict via RBFN for pred_mask pixels
-    prediction_scaled = np.full(
+    prediction_physical = np.full(
         (X_raw.shape[0], EXPECTED_OUT_FEATURES),
         np.nan,
         dtype=np.float32,
     )
 
+    # A. PRESERVE GROUND TRUTH FIRST
+    if np.any(real_obs_mask) and target_flat is not None:
+        prediction_physical[real_obs_mask] = target_flat[real_obs_mask]
+
+    # B. RBFN PREDICTION FOR GAPS
     if np.any(pred_mask):
         X_valid = X_raw[pred_mask]
         X_scaled = (X_valid - x_mean) / x_std
         X_scaled = np.ascontiguousarray(X_scaled, dtype=np.float32)
 
-        prediction_scaled[pred_mask] = predict_in_chunks(
+        prediction_scaled = predict_in_chunks(
             model=model,
             X=X_scaled,
             chunk_size=chunk_size,
         )
 
-    # 4. Unscale predictions back to physical surface reflectance
-    prediction_physical = np.full(
-        prediction_scaled.shape,
-        np.nan,
-        dtype=np.float32,
-    )
+        prediction_physical[pred_mask] = (prediction_scaled * y_std) + y_mean
 
-    if np.any(pred_mask):
-        prediction_physical[pred_mask] = (
-            prediction_scaled[pred_mask] * y_std
-        ) + y_mean
-
-    # Fallback for isolated pixels with zero temporal neighbors
+    # C. FALLBACK FOR ISOLATED GAPS
     if np.any(fallback_mask):
         prediction_physical[fallback_mask] = y_mean
 
-    # -----------------------------------------------------------------
-    # 5. RETAIN GROUND TRUTH FOR PARTIAL SCENES (<80% COVERAGE RULE)
-    # -----------------------------------------------------------------
-    target_cube = processor.load_target_month(year, month) if hasattr(processor, "load_target_month") else None
-    
-    if target_cube is not None:
-        target_flat = flatten_raster_features(target_cube)
-        # Identify valid ground truth pixels in the target image
-        target_valid_mask = np.all(np.isfinite(target_flat), axis=1) & (target_flat > 0)
-        
-        coverage_ratio = np.sum(target_valid_mask) / max(np.sum(valid_mask), 1)
-        print(f"[{year}-{month:02d}] Observed Scene Coverage: {coverage_ratio * 100:.2f}%")
-
-        if coverage_ratio >= coverage_threshold:
-            print(f"[{year}-{month:02d}] Coverage >= 80%: Retaining ground truth, filling gaps only.")
-            prediction_physical[target_valid_mask] = target_flat[target_valid_mask]
-        else:
-            print(f"[{year}-{month:02d}] Coverage < 80%: Retaining available real observations and gap-filling rest.")
-            if np.any(target_valid_mask):
-                prediction_physical[target_valid_mask] = target_flat[target_valid_mask]
-
-    # 6. Reconstruct 3D GeoTIFF raster cube and calculate derived products
+    # Reconstruct 3D GeoTIFF raster cube
     height = int(target_profile["height"])
     width = int(target_profile["width"])
 
@@ -762,15 +738,8 @@ def process_gap_month(
 
     ndvi = derive_ndvi(reconstructed_cube)
 
-    band_output_path = (
-        output_dir
-        / f"landsat_{year}_{month:02d}_rbfn_gapfilled.tif"
-    )
-
-    ndvi_output_path = (
-        output_dir
-        / f"ndvi_{year}_{month:02d}_rbfn_gapfilled.tif"
-    )
+    band_output_path = output_dir / f"landsat_{year}_{month:02d}_rbfn_gapfilled.tif"
+    ndvi_output_path = output_dir / f"ndvi_{year}_{month:02d}_rbfn_gapfilled.tif"
 
     write_raster(
         path=band_output_path,
