@@ -660,6 +660,7 @@ def process_gap_month(
     month: int,
     chunk_size: int,
     output_nodata: float,
+    coverage_threshold: float = 0.80,
 ) -> bool:
     try:
         # 1. Unpack features AND per-pixel neighbor masks
@@ -688,11 +689,11 @@ def process_gap_month(
     has_prev_flat = has_prev.ravel()
     has_next_flat = has_next.ravel()
     
-    # Model prediction mask (valid environmental predictors AND at least one neighbor)
     pred_mask = valid_mask & (has_prev_flat | has_next_flat)
-    
-    # Fallback mask (valid environmental predictors BUT no neighbors available)
     fallback_mask = valid_mask & ~(has_prev_flat | has_next_flat)
+
+    print(f"[{year}-{month:02d}] RBFN Inference Pixels: {np.sum(pred_mask):,}")
+    print(f"[{year}-{month:02d}] Global Fallback Pixels: {np.sum(fallback_mask):,}")
 
     # 3. Predict via RBFN for pred_mask pixels
     prediction_scaled = np.full(
@@ -724,13 +725,32 @@ def process_gap_month(
             prediction_scaled[pred_mask] * y_std
         ) + y_mean
 
-    # -----------------------------------------------------------------
-    # FALLBACK ASSIGNMENT: Fill zero-neighbor pixels with dataset means
-    # -----------------------------------------------------------------
+    # Fallback for isolated pixels with zero temporal neighbors
     if np.any(fallback_mask):
         prediction_physical[fallback_mask] = y_mean
 
-    # 5. Reconstruct 3D GeoTIFF raster cube and calculate derived products
+    # -----------------------------------------------------------------
+    # 5. RETAIN GROUND TRUTH FOR PARTIAL SCENES (<80% COVERAGE RULE)
+    # -----------------------------------------------------------------
+    target_cube = processor.load_target_month(year, month) if hasattr(processor, "load_target_month") else None
+    
+    if target_cube is not None:
+        target_flat = flatten_raster_features(target_cube)
+        # Identify valid ground truth pixels in the target image
+        target_valid_mask = np.all(np.isfinite(target_flat), axis=1) & (target_flat > 0)
+        
+        coverage_ratio = np.sum(target_valid_mask) / max(np.sum(valid_mask), 1)
+        print(f"[{year}-{month:02d}] Observed Scene Coverage: {coverage_ratio * 100:.2f}%")
+
+        if coverage_ratio >= coverage_threshold:
+            print(f"[{year}-{month:02d}] Coverage >= 80%: Retaining ground truth, filling gaps only.")
+            prediction_physical[target_valid_mask] = target_flat[target_valid_mask]
+        else:
+            print(f"[{year}-{month:02d}] Coverage < 80%: Retaining available real observations and gap-filling rest.")
+            if np.any(target_valid_mask):
+                prediction_physical[target_valid_mask] = target_flat[target_valid_mask]
+
+    # 6. Reconstruct 3D GeoTIFF raster cube and calculate derived products
     height = int(target_profile["height"])
     width = int(target_profile["width"])
 
@@ -852,10 +872,6 @@ def main() -> None:
         ]
     )
 
-    available_months = set(
-        processor.get_available_months()
-    )
-
     total_processed = 0
     total_skipped = 0
     total_observed = 0
@@ -864,28 +880,22 @@ def main() -> None:
         int(gap_start),
         int(gap_end) + 1,
     ):
-        for month in range(
-            1,
-            13,
-        ):
-            if (
-                year,
-                month,
-            ) in available_months:
-                total_observed += 1
+        for month in range(1, 13):
+            # Check scene coverage if present
+            target_cube = processor.load_target_month(year, month) if hasattr(processor, "load_target_month") else None
+            
+            if target_cube is not None:
+                target_flat = flatten_raster_features(target_cube)
+                target_valid = np.all(np.isfinite(target_flat), axis=1) & (target_flat > 0)
+                coverage = np.sum(target_valid) / max(target_flat.shape[0], 1)
+                
+                # If scene has >= 99% valid coverage, consider it fully clean and skip processing
+                if coverage >= 0.99:
+                    total_observed += 1
+                    print(f"100% Fully clean scene, skipping: {year}-{month:02d}")
+                    continue
 
-                print(
-                    f"Observed Landsat month, "
-                    f"skipping: "
-                    f"{year}-{month:02d}"
-                )
-
-                continue
-
-            print(
-                f"Processing gap month: "
-                f"{year}-{month:02d}"
-            )
+            print(f"Processing gap month: {year}-{month:02d}")
 
             processed = process_gap_month(
                 processor=processor,
@@ -913,7 +923,7 @@ def main() -> None:
     )
 
     print(
-        f"Observed months skipped: "
+        f"Observed clean months skipped: "
         f"{total_observed}"
     )
 
@@ -926,7 +936,6 @@ def main() -> None:
         f"Gap months skipped: "
         f"{total_skipped}"
     )
-
 
 if __name__ == "__main__":
     main()
