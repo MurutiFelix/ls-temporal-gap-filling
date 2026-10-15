@@ -26,6 +26,7 @@ from rasterio.features import rasterize
 from rasterio.warp import reproject, Resampling
 from scipy.ndimage import median_filter
 from scipy.ndimage import gaussian_filter
+from scipy.interpolate import griddata
 from models.rbfn import RBFN
 from preprocessing.raster_processor import RasterProcessor
 
@@ -768,24 +769,26 @@ def write_raster(
 def load_climatological_month_composite(
     data_dir: Path, 
     month: int, 
-    target_profile: dict, 
-    search_window_years: int = 3
+    target_profile: dict
 ) -> np.ndarray:
     """
-    Computes a pixel-wise median composite across the same month in adjacent years
-    to synthesize a realistic fallback image when temporal neighbors do not exist.
+    Computes a pixel-wise median composite across historical scenes.
+    If exact target month scenes have gaps, incorporates adjacent months (month ± 1)
+    and spatially inpaints remaining NaNs so no flat lavender/purple blocks occur.
     """
     tif_files = list(data_dir.glob("*.tif")) + list(data_dir.glob("*.tiff"))
     matching_scenes = []
 
-    pattern = f"_{month:02d}_"
-    alt_pattern = f"_{month}_"
-
+    # Search for target month AND adjacent months (e.g., Feb, Mar, Apr)
+    target_months = [month, (month - 2) % 12 + 1, (month) % 12 + 1]
+    
     out_h = target_profile["height"]
     out_w = target_profile["width"]
 
     for tif_path in tif_files:
-        if pattern in tif_path.stem or alt_pattern in tif_path.stem:
+        stem = tif_path.stem
+        # Check if file belongs to target or adjacent month
+        if any(f"_{m:02d}_" in stem or f"_{m}_" in stem for m in target_months):
             try:
                 with rasterio.open(tif_path) as src:
                     dest = np.zeros((src.count, out_h, out_w), dtype=np.float32)
@@ -800,21 +803,38 @@ def load_climatological_month_composite(
                             resampling=Resampling.nearest,
                         )
                     dest = reorder_gee_to_config_bands(dest)
-                    # Keep valid observations (>0 and finite)
+                    # Set non-positive or non-finite values to NaN
                     dest[~np.isfinite(dest) | (dest <= 0)] = np.nan
                     matching_scenes.append(dest)
             except Exception:
                 continue
 
-    if matching_scenes:
-        # Compute pixel-wise median across historical monthly scenes
-        stack = np.stack(matching_scenes, axis=0)
-        composite = np.nanmedian(stack, axis=0)
-        # Replace remaining NaNs with non-zero defaults
-        composite = np.nan_to_num(composite, nan=0.05)
-        return composite
+    if not matching_scenes:
+        return None
 
-    return None
+    # Compute pixel-wise median across historical seasonal scenes
+    stack = np.stack(matching_scenes, axis=0)
+    composite = np.nanmedian(stack, axis=0)
+
+    # SPATIAL INPAINTING: If any pixel remains NaN, fill from nearest valid spatial neighbor
+    for b in range(composite.shape[0]):
+        band = composite[b]
+        nan_mask = np.isnan(band)
+        if np.any(nan_mask) and not np.all(nan_mask):
+            y_valid, x_valid = np.where(~nan_mask)
+            y_nan, x_nan = np.where(nan_mask)
+            valid_vals = band[~nan_mask]
+            
+            # Nearest neighbor spatial fill
+            band[nan_mask] = griddata(
+                (y_valid, x_valid), 
+                valid_vals, 
+                (y_nan, x_nan), 
+                method="nearest"
+            )
+            composite[b] = band
+
+    return composite
 
 def process_gap_month(
     processor: RasterProcessor,
