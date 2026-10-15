@@ -1086,20 +1086,6 @@ def main() -> None:
         int(gap_end) + 1,
     ):
         for month in range(1, 13):
-            # Check scene coverage if present
-            target_cube = processor.load_target_month(year, month) if hasattr(processor, "load_target_month") else None
-            
-            if target_cube is not None:
-                target_flat = flatten_raster_features(target_cube)
-                target_valid = np.all(np.isfinite(target_flat), axis=1) & (target_flat > 0)
-                coverage = np.sum(target_valid) / max(target_flat.shape[0], 1)
-                
-                # If scene has >= 99% valid coverage, consider it fully clean and skip processing
-                if coverage >= 0.99:
-                    total_observed += 1
-                    print(f"100% Fully clean scene, skipping: {year}-{month:02d}")
-                    continue
-
             print(f"Processing gap month: {year}-{month:02d}")
 
             processed = process_gap_month(
@@ -1122,6 +1108,8 @@ def main() -> None:
                 total_processed += 1
             else:
                 total_skipped += 1
+
+            gc.collect()
 
     print(
         "Gap-filling inference completed."
