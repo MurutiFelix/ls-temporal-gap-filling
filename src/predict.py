@@ -19,6 +19,7 @@ import numpy as np
 import rasterio
 import torch
 import yaml
+import gc
 import geopandas as gpd
 from pathlib import Path
 from typing import Dict, Tuple
@@ -772,22 +773,21 @@ def load_climatological_month_composite(
     target_profile: dict
 ) -> np.ndarray:
     """
-    Computes a pixel-wise median composite across historical scenes.
-    If exact target month scenes have gaps, incorporates adjacent months (month ± 1)
-    and spatially inpaints remaining NaNs so no flat lavender/purple blocks occur.
+    Computes a memory-efficient running mean composite across historical scenes
+    to avoid Slurm OOM kills on large spatial grids.
     """
     tif_files = list(data_dir.glob("*.tif")) + list(data_dir.glob("*.tiff"))
-    matching_scenes = []
-
-    # Search for target month AND adjacent months (e.g., Feb, Mar, Apr)
     target_months = [month, (month - 2) % 12 + 1, (month) % 12 + 1]
     
     out_h = target_profile["height"]
     out_w = target_profile["width"]
 
+    # Running sum and count matrices to keep RAM usage low (Shape: 7, H, W)
+    running_sum = np.zeros((7, out_h, out_w), dtype=np.float32)
+    running_count = np.zeros((7, out_h, out_w), dtype=np.float32)
+
     for tif_path in tif_files:
         stem = tif_path.stem
-        # Check if file belongs to target or adjacent month
         if any(f"_{m:02d}_" in stem or f"_{m}_" in stem for m in target_months):
             try:
                 with rasterio.open(tif_path) as src:
@@ -803,20 +803,28 @@ def load_climatological_month_composite(
                             resampling=Resampling.nearest,
                         )
                     dest = reorder_gee_to_config_bands(dest)
-                    # Set non-positive or non-finite values to NaN
-                    dest[~np.isfinite(dest) | (dest <= 0)] = np.nan
-                    matching_scenes.append(dest)
+                    
+                    valid_mask = np.isfinite(dest) & (dest > 0)
+                    running_sum[valid_mask] += dest[valid_mask]
+                    running_count[valid_mask] += 1.0
+                    
+                    del dest
             except Exception:
                 continue
 
-    if not matching_scenes:
+    # Compute mean composite where at least 1 valid observation exists
+    valid_composite_mask = running_count > 0
+    if not np.any(valid_composite_mask):
         return None
 
-    # Compute pixel-wise median across historical seasonal scenes
-    stack = np.stack(matching_scenes, axis=0)
-    composite = np.nanmedian(stack, axis=0)
+    composite = np.full((7, out_h, out_w), np.nan, dtype=np.float32)
+    composite[valid_composite_mask] = running_sum[valid_composite_mask] / running_count[valid_composite_mask]
 
-    # SPATIAL INPAINTING: If any pixel remains NaN, fill from nearest valid spatial neighbor
+    # Free up intermediate matrices
+    del running_sum, running_count
+    gc.collect()
+
+    # Spatial inpainting for remaining NaNs
     for b in range(composite.shape[0]):
         band = composite[b]
         nan_mask = np.isnan(band)
@@ -825,7 +833,6 @@ def load_climatological_month_composite(
             y_nan, x_nan = np.where(nan_mask)
             valid_vals = band[~nan_mask]
             
-            # Nearest neighbor spatial fill
             band[nan_mask] = griddata(
                 (y_valid, x_valid), 
                 valid_vals, 
