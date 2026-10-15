@@ -941,24 +941,35 @@ def process_gap_month(
         prediction_physical[pred_mask] = (prediction_scaled * y_std) + y_mean
 
     # C. FALLBACK FOR ISOLATED GAP PIXELS
-    if np.any(fallback_mask):
-        print(f"[{year}-{month:02d}] Synthesizing image via climatological historical month composite...")
-        
-        clim_composite = load_climatological_month_composite(
-            data_dir=landsat_dir, 
-            month=month, 
-            target_profile=target_profile
-        )
-
-        if clim_composite is not None:
-            clim_flat = flatten_raster_features(clim_composite)
-            prediction_physical[fallback_mask] = clim_flat[fallback_mask]
-        else:
+    num_fallback = np.sum(fallback_mask)
+    if num_fallback > 0:
+        # FAST PATH: Small residual gap (< 100,000 pixels) -> borrow nearest temporal neighbor or y_mean
+        if num_fallback < 100000:
+            print(f"[{year}-{month:02d}] Fast local fallback for {num_fallback:,} remaining edge pixels...")
             prev_flat = X_raw[:, 0:7]
             next_flat = X_raw[:, 7:14]
             neighbor_avg = np.where(prev_flat > 0, prev_flat, next_flat)
             fallback_vals = np.where(neighbor_avg > 0, neighbor_avg, y_mean)
             prediction_physical[fallback_mask] = fallback_vals[fallback_mask]
+
+        # HEAVY GAP PATH (>= 100,000 pixels) -> trigger climatological search across disk
+        else:
+            print(f"[{year}-{month:02d}] Heavy gap ({num_fallback:,} pixels missing). Synthesizing via climatological historical composite...")
+            clim_composite = load_climatological_month_composite(
+                data_dir=landsat_dir, 
+                month=month, 
+                target_profile=target_profile
+            )
+
+            if clim_composite is not None:
+                clim_flat = flatten_raster_features(clim_composite)
+                prediction_physical[fallback_mask] = clim_flat[fallback_mask]
+            else:
+                prev_flat = X_raw[:, 0:7]
+                next_flat = X_raw[:, 7:14]
+                neighbor_avg = np.where(prev_flat > 0, prev_flat, next_flat)
+                fallback_vals = np.where(neighbor_avg > 0, neighbor_avg, y_mean)
+                prediction_physical[fallback_mask] = fallback_vals[fallback_mask]
 
     # Mask out non-AOI background cells
     prediction_physical[~aoi_mask_flat] = np.nan
