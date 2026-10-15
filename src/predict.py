@@ -14,18 +14,20 @@ The temporal context is asymmetric at collection boundaries:
 
 Processing is skipped only if both prev_available == 0 and next_available == 0.
 """
-from pathlib import Path
-from typing import Dict, Tuple
 import joblib
 import numpy as np
 import rasterio
 import torch
 import yaml
-from models.rbfn import RBFN
-from preprocessing.raster_processor import RasterProcessor
 import geopandas as gpd
+from pathlib import Path
+from typing import Dict, Tuple
 from rasterio.features import rasterize
 from rasterio.warp import reproject, Resampling
+from scipy.ndimage import median_filter
+from scipy.ndimage import gaussian_filter
+from models.rbfn import RBFN
+from preprocessing.raster_processor import RasterProcessor
 
 EXPECTED_IN_FEATURES = 21
 EXPECTED_OUT_FEATURES = 7
@@ -127,6 +129,26 @@ def load_config(config_path: Path) -> Dict:
     with config_path.open("r", encoding="utf-8") as file:
         return yaml.safe_load(file)
 
+def fill_slc_off_scanlines(raster_cube: np.ndarray) -> np.ndarray:
+    """
+    Spatially interpolates narrow 1-3 pixel SLC-off scanline gaps in Landsat 7 imagery
+    using a 3x3 local median filter before passing as RBFN features.
+    """
+    if raster_cube is None:
+        return None
+        
+    cleaned = raster_cube.copy()
+    for b in range(cleaned.shape[0]):
+        band = cleaned[b]
+        invalid_mask = (~np.isfinite(band)) | (band <= 0)
+        
+        if np.any(invalid_mask):
+            filtered = median_filter(band, size=3)
+            # Patch only missing scanline pixels with local spatial median
+            band[invalid_mask] = filtered[invalid_mask]
+            cleaned[b] = band
+            
+    return cleaned
 
 def flatten_raster_features(
     raster_cube: np.ndarray,
@@ -459,8 +481,8 @@ def build_inference_features(processor, year, month, dem, aoi_mask):
     spatial_shape = (H, W)
 
     neighbors = processor.load_temporal_neighbors(year, month)
-    prev_cube = reorder_gee_to_config_bands(neighbors.get("landsat_prev"))
-    next_cube = reorder_gee_to_config_bands(neighbors.get("landsat_next"))
+    prev_cube = fill_slc_off_scanlines(reorder_gee_to_config_bands(neighbors.get("landsat_prev")))
+    next_cube = fill_slc_off_scanlines(reorder_gee_to_config_bands(neighbors.get("landsat_next")))
 
     # Relaxed per-pixel availability: True where at least one band is valid and > 0
     has_prev = (
@@ -476,7 +498,7 @@ def build_inference_features(processor, year, month, dem, aoi_mask):
 
     prev_clean = np.nan_to_num(prev_cube, nan=0.0) if prev_cube is not None else np.zeros((7, H, W), dtype=np.float32)
     next_clean = np.nan_to_num(next_cube, nan=0.0) if next_cube is not None else np.zeros((7, H, W), dtype=np.float32)
-
+    
     X = np.zeros((H * W, 21), dtype=np.float32)
     X[:, 0:7]   = prev_clean.reshape(7, -1).T
     X[:, 7:14]  = next_clean.reshape(7, -1).T
@@ -647,6 +669,32 @@ def derive_ndvi(
 
     return ndvi
 
+def normalize_reflectance_range(data: np.ndarray) -> np.ndarray:
+    """Ensures input imagery is strictly within float reflectance 0.0 - 1.0."""
+    if data is None:
+        return None
+        
+    # If imagery was saved in 0 - 10000 surface reflectance scale (e.g. integer SR)
+    if np.nanmax(data) > 10.0:
+        data = data / 10000.0
+        
+    return np.clip(data, 0.0, 1.0)
+
+def blend_boundary_seamless(real_obs_mask_2d, target_cube, prediction_cube):
+    """
+    Feathers the junction between real observations and RBFN predictions
+    using a 5-pixel spatial blend to eliminate orbital swath seams.
+    """
+    # Create smooth float weight mask (1.0 = Ground Truth, 0.0 = RBFN Prediction)
+    weight_mask = real_obs_mask_2d.astype(np.float32)
+    smoothed_weights = gaussian_filter(weight_mask, sigma=2.0)
+    
+    # Expand 2D weight to all 7 bands
+    smoothed_weights_3d = np.repeat(smoothed_weights[np.newaxis, :, :], 7, axis=0)
+    
+    # Blend target and prediction seamlessly
+    blended = (target_cube * smoothed_weights_3d) + (prediction_cube * (1.0 - smoothed_weights_3d))
+    return blended
 
 def write_raster(
     path: Path,
