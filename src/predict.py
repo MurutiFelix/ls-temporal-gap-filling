@@ -717,6 +717,56 @@ def write_raster(
                 output
             )
 
+def load_climatological_month_composite(
+    data_dir: Path, 
+    month: int, 
+    target_profile: dict, 
+    search_window_years: int = 3
+) -> np.ndarray:
+    """
+    Computes a pixel-wise median composite across the same month in adjacent years
+    to synthesize a realistic fallback image when temporal neighbors do not exist.
+    """
+    tif_files = list(data_dir.glob("*.tif")) + list(data_dir.glob("*.tiff"))
+    matching_scenes = []
+
+    pattern = f"_{month:02d}_"
+    alt_pattern = f"_{month}_"
+
+    out_h = target_profile["height"]
+    out_w = target_profile["width"]
+
+    for tif_path in tif_files:
+        if pattern in tif_path.stem or alt_pattern in tif_path.stem:
+            try:
+                with rasterio.open(tif_path) as src:
+                    dest = np.zeros((src.count, out_h, out_w), dtype=np.float32)
+                    for b in range(1, src.count + 1):
+                        reproject(
+                            source=rasterio.band(src, b),
+                            destination=dest[b - 1],
+                            src_transform=src.transform,
+                            src_crs=src.crs,
+                            dst_transform=target_profile["transform"],
+                            dst_crs=target_profile["crs"],
+                            resampling=Resampling.nearest,
+                        )
+                    dest = reorder_gee_to_config_bands(dest)
+                    # Keep valid observations (>0 and finite)
+                    dest[~np.isfinite(dest) | (dest <= 0)] = np.nan
+                    matching_scenes.append(dest)
+            except Exception:
+                continue
+
+    if matching_scenes:
+        # Compute pixel-wise median across historical monthly scenes
+        stack = np.stack(matching_scenes, axis=0)
+        composite = np.nanmedian(stack, axis=0)
+        # Replace remaining NaNs with non-zero defaults
+        composite = np.nan_to_num(composite, nan=0.05)
+        return composite
+
+    return None
 
 def process_gap_month(
     processor: RasterProcessor,
@@ -817,11 +867,23 @@ def process_gap_month(
 
     # C. FALLBACK FOR ISOLATED GAP PIXELS
     if np.any(fallback_mask):
-        prev_flat = X_raw[:, 0:7]
-        next_flat = X_raw[:, 7:14]
-        neighbor_avg = np.where(prev_flat > 0, prev_flat, next_flat)
-        fallback_vals = np.where(neighbor_avg > 0, neighbor_avg, y_mean)
-        prediction_physical[fallback_mask] = fallback_vals[fallback_mask]
+        print(f"[{year}-{month:02d}] Synthesizing image via climatological historical month composite...")
+        
+        clim_composite = load_climatological_month_composite(
+            data_dir=landsat_dir, 
+            month=month, 
+            target_profile=target_profile
+        )
+
+        if clim_composite is not None:
+            clim_flat = flatten_raster_features(clim_composite)
+            prediction_physical[fallback_mask] = clim_flat[fallback_mask]
+        else:
+            prev_flat = X_raw[:, 0:7]
+            next_flat = X_raw[:, 7:14]
+            neighbor_avg = np.where(prev_flat > 0, prev_flat, next_flat)
+            fallback_vals = np.where(neighbor_avg > 0, neighbor_avg, y_mean)
+            prediction_physical[fallback_mask] = fallback_vals[fallback_mask]
 
     # Mask out non-AOI background cells
     prediction_physical[~aoi_mask_flat] = np.nan
@@ -859,7 +921,6 @@ def process_gap_month(
     print(f"Saved NDVI: {ndvi_output_path}")
 
     return True
-
 
 def main() -> None:
     root_dir = (
