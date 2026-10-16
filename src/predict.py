@@ -85,9 +85,10 @@ def find_and_load_target_scene(data_dir: Path, year: int, month: int, target_pro
                         resampling=Resampling.nearest
                     )
                 
+                destination = normalize_reflectance_range(destination)
                 destination = reorder_gee_to_config_bands(destination)
-                
-                return destination, tif_path
+
+                return destination, tif_path 
                 
     return None, None
 
@@ -483,8 +484,8 @@ def build_inference_features(processor, year, month, dem, aoi_mask):
     spatial_shape = (H, W)
 
     neighbors = processor.load_temporal_neighbors(year, month)
-    prev_cube = fill_slc_off_scanlines(reorder_gee_to_config_bands(neighbors.get("landsat_prev")))
-    next_cube = fill_slc_off_scanlines(reorder_gee_to_config_bands(neighbors.get("landsat_next")))
+    prev_cube = fill_slc_off_scanlines(neighbors.get("landsat_prev"))
+    next_cube = fill_slc_off_scanlines(neighbors.get("landsat_next"))
 
     aoi_total_pixels = np.sum(aoi_mask)
 
@@ -1018,6 +1019,13 @@ def process_gap_month(
 
     print(f"Saved bands: {band_output_path}")
     print(f"Saved NDVI: {ndvi_output_path}")
+
+    # Diagnostic sanity log: Band 1 (Red) vs Band 3 (Blue)
+    valid_reconstructed = np.isfinite(reconstructed_cube[0]) & (reconstructed_cube[0] > 0)
+    if np.any(valid_reconstructed):
+        r_mean = np.mean(reconstructed_cube[0][valid_reconstructed]) # Index 0 = Red
+        b_mean = np.mean(reconstructed_cube[2][valid_reconstructed]) # Index 2 = Blue
+        print(f"[{year}-{month:02d}] Final Output Sanity -> Red (Band 1): {r_mean:.4f} | Blue (Band 3): {b_mean:.4f}")
 
     return True
 
