@@ -85,7 +85,6 @@ def find_and_load_target_scene(data_dir: Path, year: int, month: int, target_pro
                         resampling=Resampling.nearest
                     )
                 
-                destination = normalize_reflectance_range(destination)
                 destination = reorder_gee_to_config_bands(destination)
 
                 return destination, tif_path 
