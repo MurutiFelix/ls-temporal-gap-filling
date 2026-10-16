@@ -783,16 +783,16 @@ def load_climatological_month_composite(
     target_profile: dict
 ) -> np.ndarray:
     """
-    Computes a memory-efficient running mean composite across historical scenes
-    to avoid Slurm OOM kills on large spatial grids.
+    Computes a memory-efficient running mean composite across historical scenes,
+    strictly ignoring zero/near-zero NoData pixels and filling persistent gaps.
     """
     tif_files = list(data_dir.glob("*.tif")) + list(data_dir.glob("*.tiff"))
+    # Include target month + adjacent months (e.g., Feb, Mar, Apr for March)
     target_months = [month, (month - 2) % 12 + 1, (month) % 12 + 1]
     
     out_h = target_profile["height"]
     out_w = target_profile["width"]
 
-    # Running sum and count matrices to keep RAM usage low (Shape: 7, H, W)
     running_sum = np.zeros((7, out_h, out_w), dtype=np.float32)
     running_count = np.zeros((7, out_h, out_w), dtype=np.float32)
 
@@ -814,7 +814,8 @@ def load_climatological_month_composite(
                         )
                     dest = reorder_gee_to_config_bands(dest)
                     
-                    valid_mask = np.isfinite(dest) & (dest > 0)
+                    # FIX 1: Require strictly POSITIVE reflectance (> 0.005) to ignore orbit gaps/shadow zeroes
+                    valid_mask = np.isfinite(dest) & (dest > 0.005)
                     running_sum[valid_mask] += dest[valid_mask]
                     running_count[valid_mask] += 1.0
                     
@@ -822,7 +823,6 @@ def load_climatological_month_composite(
             except Exception:
                 continue
 
-    # Compute mean composite where at least 1 valid observation exists
     valid_composite_mask = running_count > 0
     if not np.any(valid_composite_mask):
         return None
@@ -830,20 +830,22 @@ def load_climatological_month_composite(
     composite = np.full((7, out_h, out_w), np.nan, dtype=np.float32)
     composite[valid_composite_mask] = running_sum[valid_composite_mask] / running_count[valid_composite_mask]
 
-    # Free up intermediate matrices
     del running_sum, running_count
     gc.collect()
 
-    # Spatial inpainting for remaining NaNs
+    # FIX 2: Force spatial inpainting for any pixel that failed the > 0.005 threshold
     for b in range(composite.shape[0]):
         band = composite[b]
-        nan_mask = np.isnan(band)
-        if np.any(nan_mask) and not np.all(nan_mask):
-            y_valid, x_valid = np.where(~nan_mask)
-            y_nan, x_nan = np.where(nan_mask)
-            valid_vals = band[~nan_mask]
+        # Treat non-finite or sub-threshold zeroes as true NaNs
+        invalid_mask = (~np.isfinite(band)) | (band <= 0.005)
+        
+        if np.any(~invalid_mask) and np.any(invalid_mask):
+            y_valid, x_valid = np.where(~invalid_mask)
+            y_nan, x_nan = np.where(invalid_mask)
+            valid_vals = band[~invalid_mask]
             
-            band[nan_mask] = griddata(
+            # Fill missing north block with nearest valid terrain values
+            band[invalid_mask] = griddata(
                 (y_valid, x_valid), 
                 valid_vals, 
                 (y_nan, x_nan), 
