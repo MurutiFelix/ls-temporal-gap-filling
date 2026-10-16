@@ -486,17 +486,28 @@ def build_inference_features(processor, year, month, dem, aoi_mask):
     prev_cube = fill_slc_off_scanlines(reorder_gee_to_config_bands(neighbors.get("landsat_prev")))
     next_cube = fill_slc_off_scanlines(reorder_gee_to_config_bands(neighbors.get("landsat_next")))
 
-    # Relaxed per-pixel availability: True where at least one band is valid and > 0
-    has_prev = (
-        np.any(np.isfinite(prev_cube) & (prev_cube > 0), axis=0)
-        if prev_cube is not None
-        else np.zeros(spatial_shape, dtype=bool)
+    aoi_total_pixels = np.sum(aoi_mask)
+
+    # Check per-pixel validity
+    prev_valid_pixels = (
+        np.all(np.isfinite(prev_cube) & (prev_cube > 0.001), axis=0) & aoi_mask
+        if prev_cube is not None else np.zeros(spatial_shape, dtype=bool)
     )
-    has_next = (
-        np.any(np.isfinite(next_cube) & (next_cube > 0), axis=0)
-        if next_cube is not None
-        else np.zeros(spatial_shape, dtype=bool)
+    next_valid_pixels = (
+        np.all(np.isfinite(next_cube) & (next_cube > 0.001), axis=0) & aoi_mask
+        if next_cube is not None else np.zeros(spatial_shape, dtype=bool)
     )
+
+    # 1. SCENE-LEVEL 80% COVERAGE THRESHOLD FOR RBFN INFERENCE
+    prev_cov_pct = (np.sum(prev_valid_pixels) / max(aoi_total_pixels, 1)) * 100.0
+    next_cov_pct = (np.sum(next_valid_pixels) / max(aoi_total_pixels, 1)) * 100.0
+
+    # Only enable RBFN inference for neighbors that meet or exceed 80% coverage
+    use_prev_for_rbfn = prev_cov_pct >= 80.0
+    use_next_for_rbfn = next_cov_pct >= 80.0
+
+    has_prev = prev_valid_pixels if use_prev_for_rbfn else np.zeros(spatial_shape, dtype=bool)
+    has_next = next_valid_pixels if use_next_for_rbfn else np.zeros(spatial_shape, dtype=bool)
 
     prev_clean = np.nan_to_num(prev_cube, nan=0.0) if prev_cube is not None else np.zeros((7, H, W), dtype=np.float32)
     next_clean = np.nan_to_num(next_cube, nan=0.0) if next_cube is not None else np.zeros((7, H, W), dtype=np.float32)
@@ -513,7 +524,6 @@ def build_inference_features(processor, year, month, dem, aoi_mask):
     X[:, 19]    = processor.load_era5_predictor("temp", year, month).ravel()
     X[:, 20]    = dem.ravel()
 
-    # Valid mask requires pixels to be strictly INSIDE the AOI and have valid environmental predictors
     aoi_mask_flat = aoi_mask.ravel()
     valid_mask = aoi_mask_flat & np.all(np.isfinite(X[:, 18:21]), axis=1)
 
