@@ -784,10 +784,9 @@ def load_climatological_month_composite(
 ) -> np.ndarray:
     """
     Computes a memory-efficient running mean composite across historical scenes,
-    strictly ignoring zero/near-zero NoData pixels and filling persistent gaps.
+    strictly normalizing reflectance and preventing double-reordering blue artifacts.
     """
     tif_files = list(data_dir.glob("*.tif")) + list(data_dir.glob("*.tiff"))
-    # Include target month + adjacent months (e.g., Feb, Mar, Apr for March)
     target_months = [month, (month - 2) % 12 + 1, (month) % 12 + 1]
     
     out_h = target_profile["height"]
@@ -812,9 +811,13 @@ def load_climatological_month_composite(
                             dst_crs=target_profile["crs"],
                             resampling=Resampling.nearest,
                         )
+                    
+                    # 1. Normalize integer reflectance (0-10000) to float (0.0-1.0)
+                    dest = normalize_reflectance_range(dest)
+                    
+                    # 2. Reorder GEE [Blue, Green, Red...] to Model [Red, Green, Blue...]
                     dest = reorder_gee_to_config_bands(dest)
                     
-                    # FIX 1: Require strictly POSITIVE reflectance (> 0.005) to ignore orbit gaps/shadow zeroes
                     valid_mask = np.isfinite(dest) & (dest > 0.005)
                     running_sum[valid_mask] += dest[valid_mask]
                     running_count[valid_mask] += 1.0
@@ -833,10 +836,9 @@ def load_climatological_month_composite(
     del running_sum, running_count
     gc.collect()
 
-    # FIX 2: Force spatial inpainting for any pixel that failed the > 0.005 threshold
+    # Spatial inpainting for remaining NaNs / sub-threshold pixels
     for b in range(composite.shape[0]):
         band = composite[b]
-        # Treat non-finite or sub-threshold zeroes as true NaNs
         invalid_mask = (~np.isfinite(band)) | (band <= 0.005)
         
         if np.any(~invalid_mask) and np.any(invalid_mask):
@@ -844,7 +846,6 @@ def load_climatological_month_composite(
             y_nan, x_nan = np.where(invalid_mask)
             valid_vals = band[~invalid_mask]
             
-            # Fill missing north block with nearest valid terrain values
             band[invalid_mask] = griddata(
                 (y_valid, x_valid), 
                 valid_vals, 
