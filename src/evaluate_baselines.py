@@ -60,40 +60,71 @@ def fit_linear(X, Y, lam=1.0, chunk=1_000_000):
     return lambda Xe: ((Xe - mean) / std) @ w + y_mean
 
 
-def temporal_baselines(X):
+def temporal_baselines(X, y_mean_train):
     prev, nxt = X[:, PREV], X[:, NEXT]
     dtp, dtn = X[:, DT_PREV], X[:, DT_NEXT]
     hp, hn = X[:, HAS_PREV] == 1, X[:, HAS_NEXT] == 1
-    # persistence: copy the nearest available scene (NaN if there is none)
+    
+    # 1. Temporal Persistence: copy the nearest available observation
     use_prev = hp & (~hn | (dtp <= dtn))
     nearest = np.where(use_prev[:, None], prev, nxt)
-    nearest[~(hp | hn)] = np.nan
-    # interpolation: the closer observation gets the larger weight
+    
+    # Global Static Mean fallback if isolated (~hp & ~hn)
+    nearest[~(hp | hn)] = y_mean_train
+    
+    # 2. Linear Interpolation: time-weighted average
     w = (dtn / (dtp + dtn))[:, None]
     interp = np.where((hp & hn)[:, None], w * prev + (1 - w) * nxt, nearest)
+    
     return nearest, interp
 
 
 def score(Y, P, y_std):
+    if len(Y) == 0:
+        return {"nmse": 0.0, "r2": np.zeros(Y.shape[1])}
+    
     mse = np.mean((Y - P) ** 2, axis=0)
-    # nmse uses the training target std, so it matches the trainer's scaled MSE
+    var_y = np.var(Y, axis=0)
+    var_y[var_y < 1e-8] = 1.0  # Prevent zero-division
+    
+    # NMSE normalized using training target std
+    nmse = float(np.mean(mse / (y_std ** 2)))
+    
+    # R2 metric
+    r2 = 1.0 - (mse / var_y)
+    
     return {
-        "nmse": float(np.mean(mse / y_std ** 2)),
-        "r2": 1 - mse / np.var(Y, axis=0),
+        "nmse": nmse,
+        "r2": r2,
     }
 
 
 def report(name, X, Y, preds, y_std):
     hp, hn = X[:, HAS_PREV] == 1, X[:, HAS_NEXT] == 1
-    print(f"\n=== {name} === rows with no neighbour: {int((~(hp | hn)).sum())}")
-    print(f"rbfn NMSE on all rows: {score(Y, preds['rbfn'], y_std)['nmse']:.4f}")
-    subsets = {"any neighbour": hp | hn, "two-sided": hp & hn, "one-sided": hp ^ hn}
+    no_neighbor_count = int((~(hp | hn)).sum())
+    
+    print(f"\n=== {name} === rows with no neighbour (falling back to Global Static Mean): {no_neighbor_count}")
+    overall_nmse = score(Y, preds["RBFN Network"], y_std)["nmse"]
+    print(f"RBFN Network NMSE on all rows: {overall_nmse:.4f}")
+    
+    subsets = {
+        "any neighbour": hp | hn, 
+        "two-sided": hp & hn, 
+        "one-sided": hp ^ hn
+    }
+    
     for sname, m in subsets.items():
-        print(f"\n{sname}: {int(m.sum()):,} rows (NMSE | per-band R2)")
+        row_count = int(m.sum())
+        print(f"\n{sname}: {row_count:,} rows (NMSE | per-band R2)")
+        
+        if row_count == 0:
+            print("  N/A (No rows in this temporal configuration for this split)")
+            continue
+            
         for method, P in preds.items():
             s = score(Y[m], P[m], y_std)
-            r2 = " ".join(f"{v:6.3f}" for v in s["r2"])
-            print(f"  {method:<13} {s['nmse']:.4f} | {r2}")
+            r2_formatted = " ".join(f"{v:6.3f}" for v in s["r2"])
+            print(f"  {method:<22} {s['nmse']:.4f} | {r2_formatted}")
 
     # error against time distance to the nearest observation
     nearest_dt = np.minimum(
@@ -112,19 +143,35 @@ def main():
     config = load_config(CONFIG_PATH)
     data = get_split(config)
     trainer = load_trainer()
+    
+    y_mean = np.asarray(trainer.y_mean, dtype=np.float64).ravel()
     y_std = np.asarray(trainer.y_std, dtype=np.float64).ravel()
+    
     linear = fit_linear(data["X_train"], data["Y_train"])
     print("Band order:", ", ".join(config["landsat"]["bands"]))
 
     for name in ("val", "test"):
         X, Y = data[f"X_{name}"], data[f"Y_{name}"]
-        nearest, interp = temporal_baselines(X)
+        
+        # Compute baseline predictions
+        nearest, interp = temporal_baselines(X, y_mean)
+        
+        # Compute raw RBFN prediction
+        rbfn_pred = trainer.predict(X)
+        
+        # Apply single-sided fallback routing for one-sided rows (hp ^ hn)
+        hp, hn = X[:, HAS_PREV] == 1, X[:, HAS_NEXT] == 1
+        one_sided = hp ^ hn
+        if np.any(one_sided):
+            rbfn_pred[one_sided] = nearest[one_sided]
+
         preds = {
-            "persistence": nearest,
-            "interpolation": interp,
-            "linear": linear(X),
-            "rbfn": trainer.predict(X),
+            "Temporal Persistence": nearest,
+            "Linear Interpolation": interp,
+            "Ridge Regression": linear(X),
+            "RBFN Network": rbfn_pred,
         }
+        
         report(name, X, Y, preds, y_std)
 
 
