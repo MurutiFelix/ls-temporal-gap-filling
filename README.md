@@ -24,27 +24,35 @@
 │
 ├── notebooks/                          # STRICTLY EDA & EXPLORATORY VISUALIZATIONS
 │   ├── temporal_gaps.py                # Visual gap analysis, heatmaps, missingness breakdown
-│   └──  extract_gap_months.py
-└── src/                               # MAIN SOURCE CODE
-    ├── config.yaml                     # Centralized pipeline config (paths, hyperparams, bands, seeds)
-    ├── train.py                        # Root execution orchestrator 
-    ├── predict.py                      # Out-of-sample historical gap filler 
-    │
-    ├── logs/                           # Slurm execution stdout/stderr
-    │
-    ├── preprocessing/                 # DATA ENGINEERING & RASTER PROCESSING
-    │   ├── dataset.py                  # PyTorch Dataset/DataLoader for RBFN streaming
-    │   └──  raster_processor.py         # Resampling, scale standardization (0-1), 3D-to-2D matrix flattening
-    │
-    ├── models/                        # MODEL ARCHITECTURES & TRAINING PIPELINES
-    │   ├── run_rbfn.sh                 # Slurm HPC script for PyTorch RBFN training
-    │   ├── train_rbfn.py               # Training loop, loss tracking, and metrics for RBFN
-    │   ├── tuning.py
-    │   └── rbfn.py                     # Multi-Output RBFN PyTorch Architecture (Gaussian Kernels)
-    │    
-    └── utils/                         # UTILITIES & GEOSPATIAL HELPERS
-        ├── spatial.py                  # Spatial windowing, coordinate encoding, spatial weight matrices
-        └── metrics.py                  # RMSE/SSIM/error scoring
-
+│   └── extract_gap_months.py
+├── src/                               # MAIN SOURCE CODE
+│    ├── config.yaml                     # Centralized pipeline config (paths, hyperparams, bands, seeds)
+│    ├── train.py                        # Root execution orchestrator 
+│    ├── predict.py                      # Out-of-sample historical gap filler 
+│    ├── env.sh
+│    ├── evaluate_baselines.py
+│    ├── rbfn_predict.sh
+│    ├── run_eval.sh
+│    │
+│    ├── logs/                           # Slurm execution stdout/stderr
+│    │
+│    ├── preprocessing/                 # DATA ENGINEERING & RASTER PROCESSING
+│    │   ├── dataset.py                  # PyTorch Dataset/DataLoader for RBFN streaming
+│    │   └── raster_processor.py         # Resampling, scale standardization (0-1), 3D-to-2D matrix flattening
+│    │
+│    ├── models/                        # MODEL ARCHITECTURES & TRAINING PIPELINES
+│    │   ├── run_rbfn.sh                 # Slurm HPC script for PyTorch RBFN training
+│    │   ├── train_rbfn.py               # Training loop, loss tracking, and metrics for RBFN
+│    │   ├── tuning.py
+│    │   └── rbfn.py                     # Multi-Output RBFN PyTorch Architecture (Gaussian Kernels)
+│    │    
+│    └── utils/                         # UTILITIES & GEOSPATIAL HELPERS
+│        ├── spatial.py                  # Spatial windowing, coordinate encoding, spatial weight matrices
+│        └── metrics.py                  # RMSE/SSIM/error scoring
+│
+└── Outputs/
+         ├── Gapfilled                 # Spatial windowing, coordinate encoding, spatial weight matrices
+         └── Continuous
+         
 ```
 The required bands/Target bands are Red, Green, Blue, NIR, SWIR(1&2) and Thermal 
