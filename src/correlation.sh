@@ -1,5 +1,5 @@
 #!/bin/bash
-#SBATCH --job-name=rbfn_corr
+#SBATCH --job-name=rbfn_correlation
 #SBATCH --partition=normal
 #SBATCH --nodes=1
 #SBATCH --ntasks-per-node=1
@@ -9,24 +9,25 @@
 #SBATCH --time=1-00:00:00
 #SBATCH --output=logs/rbfn_corr_%j.out
 #SBATCH --error=logs/rbfn_corr_%j.err
-# Ensure output logs directory exists
-mkdir -p logs
 
+# --- Working Directory Setup ---
+cd /scratch/lustre/users/$USER/ls-temporal-gap-filling
+mkdir -p logs
+export PYTHONPATH="${PYTHONPATH}:${SLURM_SUBMIT_DIR}"
+
+# --- Environment Setup ---
+module purge
+module load applications/eng/gpu/python/conda-26.1.0-python-3.12-vLLM
+source /scratch/lustre/apps/eng/gpu/miniconda3/etc/profile.d/conda.sh
+conda activate /scratch/lustre/users/$USER/envs/rbfn_env
+
+# --- Diagnostics ---
 echo "Job started on: $(date)"
 echo "Running on node: $(hostname)"
 echo "Running from: $(pwd)"
+echo "Using python: $(which python)"
 
-# Activate Python environment
-ENV_PATH="/scratch/lustre/users/fngari/envs/rbfn_env/bin/activate"
-if [ -f "$ENV_PATH" ]; then
-    source "$ENV_PATH"
-    echo "Using python: $(which python)"
-else
-    echo "Error: Virtual environment not found at $ENV_PATH"
-    exit 1
-fi
-
-# Run NDVI correlation & SSIM evaluation
-python src/evaluate_ndvi_correlation.py
+# --- Run Multi-Sensor NDVI Evaluation ---
+python -u -m src.evaluate_ndvi_correlation
 
 echo "Job finished on: $(date)"
