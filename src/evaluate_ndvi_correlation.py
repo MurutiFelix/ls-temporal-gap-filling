@@ -2,7 +2,7 @@
 
 """
 Comprehensive NDVI Cross-Sensor Validation Pipeline.
-Evaluates Landsat (Gap-Filled and Compiled Raw) against MODIS and AVHRR benchmarks (1995-2025).
+Evaluates Landsat (Gap-Filled and Compiled Raw) against MODIS (2000-2025) and AVHRR (1995-2022) benchmarks.
 """
 
 import re
@@ -140,14 +140,18 @@ def main():
     modis_map = build_reference_map(MODIS_DIR, "modis")
     avhrr_map = build_reference_map(AVHRR_DIR, "avhrr")
 
-    print(f"Indexed {len(avhrr_map)} AVHRR reference files (avhrr_ndvi_YYYY_MM.tif).")
-    print(f"Indexed {len(modis_map)} MODIS reference files (modis_ndvi_YYYY_MM.tif).\n")
+    print(f"Indexed {len(avhrr_map)} AVHRR reference files (1995_01 to 2022_05).")
+    print(f"Indexed {len(modis_map)} MODIS reference files (2000_02 to 2025_12).\n")
 
     results = []
 
-    # 1. EVALUATE GAP-FILLED OUTPUTS (Model Reconstructions)
-    gapfilled_files = list(GAPFILLED_DIR.glob("*.tif"))
-    print(f"Evaluating {len(gapfilled_files)} files in outputs/gapfilled/...")
+    # 1. EVALUATE GAP-FILLED OUTPUTS (Target specifically pre-computed _NDVI.tif rasters)
+    gapfilled_files = list(GAPFILLED_DIR.glob("*NDVI*.tif")) + list(GAPFILLED_DIR.glob("*ndvi*.tif"))
+    if not gapfilled_files:
+        # Fallback to general .tif if NDVI files are not explicitly named with 'NDVI'
+        gapfilled_files = list(GAPFILLED_DIR.glob("*.tif"))
+
+    print(f"Evaluating {len(gapfilled_files)} gap-filled files in outputs/gapfilled/...")
 
     for gf_path in gapfilled_files:
         match = re.search(r"_(\d{4})_(\d{1,2})", gf_path.stem)
@@ -155,13 +159,13 @@ def main():
             continue
         key = (int(match.group(1)), int(match.group(2)))
 
-        # Compare vs AVHRR (1995-2024)
+        # Compare vs AVHRR if present in avhrr_map (1995_01 to 2022_05)
         if key in avhrr_map:
             res = evaluate_ndvi_pair(gf_path, avhrr_map[key], "AVHRR", "GapFilled")
             if res:
                 results.append(res)
 
-        # Compare vs MODIS (2003-2025)
+        # Compare vs MODIS if present in modis_map (2000_02 to 2025_12)
         if key in modis_map:
             res = evaluate_ndvi_pair(gf_path, modis_map[key], "MODIS", "GapFilled")
             if res:
