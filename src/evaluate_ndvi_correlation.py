@@ -46,13 +46,13 @@ def load_or_compute_ndvi(tif_path: Path) -> Tuple[np.ndarray, dict]:
 def evaluate_ndvi_pair(
     landsat_path: Path, ref_path: Path, sensor_name: str, scene_type: str
 ) -> dict:
-    """Reprojects reference NDVI to Landsat grid and computes r, RMSE, and SSIM."""
+    """Reprojects reference NDVI to exact Landsat 30m grid and computes r, RMSE, and SSIM."""
     ls_ndvi, ls_profile = load_or_compute_ndvi(landsat_path)
 
     with rasterio.open(ref_path) as src_ref:
         ref_raw = src_ref.read(1).astype(np.float32)
 
-        # Scale check for reference integer rasters (e.g., MODIS scaled by 10,000)
+        # Scale check for integer reflectance/NDVI scale (e.g. MODIS scaled by 10,000)
         if np.nanmedian(ref_raw[ref_raw > 0]) > 1.0:
             ref_raw = ref_raw / 10000.0
 
@@ -67,7 +67,7 @@ def evaluate_ndvi_pair(
             resampling=Resampling.bilinear,
         )
 
-    # Valid mask inside catchment
+    # Valid mask inside catchment boundary
     valid = (
         np.isfinite(ls_ndvi)
         & np.isfinite(ref_resampled)
@@ -81,10 +81,13 @@ def evaluate_ndvi_pair(
     ls_v = ls_ndvi[valid]
     ref_v = ref_resampled[valid]
 
+    # 1. Pearson Correlation (r)
     r_val, _ = pearsonr(ls_v, ref_v)
+    
+    # 2. Root Mean Squared Error (RMSE)
     rmse_val = np.sqrt(np.mean((ls_v - ref_v) ** 2))
 
-    # Fill neutral median for 2D SSIM
+    # 3. Structural Similarity Index (SSIM)
     ls_2d = np.where(valid, ls_ndvi, np.nanmedian(ls_v))
     ref_2d = np.where(valid, ref_resampled, np.nanmedian(ref_v))
     ssim_val = ssim(ls_2d, ref_2d, data_range=2.0)
@@ -117,7 +120,6 @@ def build_reference_map(directory: Path, prefix: str) -> dict:
         print(f"Warning: Directory does not exist -> {directory}")
         return mapping
 
-    # Match modis_ndvi_YYYY_MM or avhrr_ndvi_YYYY_MM
     pattern = re.compile(rf"{prefix}_ndvi_(\d{{4}})_(\d{{1,2}})", re.IGNORECASE)
 
     tif_files = list(directory.glob("*.tif")) + list(directory.glob("*.tiff"))
@@ -145,10 +147,9 @@ def main():
 
     results = []
 
-    # 1. EVALUATE GAP-FILLED OUTPUTS (Target specifically pre-computed _NDVI.tif rasters)
+    # 1. EVALUATE GAP-FILLED OUTPUTS (Target pre-computed _NDVI.tif rasters)
     gapfilled_files = list(GAPFILLED_DIR.glob("*NDVI*.tif")) + list(GAPFILLED_DIR.glob("*ndvi*.tif"))
     if not gapfilled_files:
-        # Fallback to general .tif if NDVI files are not explicitly named with 'NDVI'
         gapfilled_files = list(GAPFILLED_DIR.glob("*.tif"))
 
     print(f"Evaluating {len(gapfilled_files)} gap-filled files in outputs/gapfilled/...")
@@ -159,13 +160,11 @@ def main():
             continue
         key = (int(match.group(1)), int(match.group(2)))
 
-        # Compare vs AVHRR if present in avhrr_map (1995_01 to 2022_05)
         if key in avhrr_map:
             res = evaluate_ndvi_pair(gf_path, avhrr_map[key], "AVHRR", "GapFilled")
             if res:
                 results.append(res)
 
-        # Compare vs MODIS if present in modis_map (2000_02 to 2025_12)
         if key in modis_map:
             res = evaluate_ndvi_pair(gf_path, modis_map[key], "MODIS", "GapFilled")
             if res:
@@ -194,6 +193,7 @@ def main():
     # SAVE RESULTS
     if results:
         df = pd.DataFrame(results)
+        RESULTS_CSV.parent.mkdir(parents=True, exist_ok=True)
         df.to_csv(RESULTS_CSV, index=False)
         print(f"\n=========================================================")
         print(f" Successfully saved metric results to: {RESULTS_CSV}")
