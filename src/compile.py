@@ -122,13 +122,44 @@ def load_and_align_raw_scene(tif_path: Path, target_profile: dict) -> np.ndarray
         return destination
 
 
-def find_scene_path(search_dir: Path, year: int, month: int) -> Path:
+def load_and_align_gapfilled_scene(tif_path: Path, target_profile: dict) -> np.ndarray:
+    """
+    Loads and reprojects a gap-filled raster to match target_profile dimensions exactly.
+    """
+    with rasterio.open(tif_path) as src:
+        out_h = target_profile["height"]
+        out_w = target_profile["width"]
+        out_crs = target_profile["crs"]
+        out_transform = target_profile["transform"]
+
+        destination = np.zeros((src.count, out_h, out_w), dtype=np.float32)
+
+        for band_idx in range(1, src.count + 1):
+            reproject(
+                source=rasterio.band(src, band_idx),
+                destination=destination[band_idx - 1],
+                src_transform=src.transform,
+                src_crs=src.crs,
+                dst_transform=out_transform,
+                dst_crs=out_crs,
+                resampling=Resampling.nearest,
+            )
+
+        if np.nanmedian(destination[destination > 0]) > 1.0:
+            destination = destination / 10000.0
+
+        return np.clip(destination, 0.0, 1.0)
+
+
+def find_scene_path(search_dir: Path, year: int, month: int, exclude_pattern: str = "NDVI") -> Path:
     """Locates scene file matching year and month in target folder."""
     p1 = f"_{year}_{month:02d}"
     p2 = f"_{year}_{month}"
 
     tif_files = list(search_dir.glob("*.tif")) + list(search_dir.glob("*.tiff"))
     for f in tif_files:
+        if exclude_pattern and exclude_pattern.lower() in f.stem.lower():
+            continue
         if p1 in f.stem or p2 in f.stem:
             return f
     return None
@@ -177,8 +208,8 @@ def process_month_compilation(
     """
     Compiles a single target month and returns (source_type, compiled_filename, coverage_pct).
     """
-    raw_path = find_scene_path(RAW_DIR, year, month)
-    gapfilled_path = find_scene_path(GAPFILLED_DIR, year, month)
+    raw_path = find_scene_path(RAW_DIR, year, month, exclude_pattern=None)
+    gapfilled_path = find_scene_path(GAPFILLED_DIR, year, month, exclude_pattern="NDVI")
 
     selected_data = None
     compiled_filename = None
@@ -206,16 +237,12 @@ def process_month_compilation(
     # 2. FALLBACK TO GAPFILLED SCENE IF RAW IS MISSING OR < 80% COVERAGE
     if selected_data is None:
         if gapfilled_path is not None:
-            with rasterio.open(gapfilled_path) as src:
-                gap_cube = src.read()
-                if np.nanmedian(gap_cube[gap_cube > 0]) > 1.0:
-                    gap_cube = gap_cube / 10000.0
-                gap_cube = np.clip(gap_cube, 0.0, 1.0)
-                selected_data = gap_cube
-                source_type = "GAPFILLED"
-                
-                # Gap-filled naming convention: landsat_YYYY_MM_GP.tif
-                compiled_filename = f"landsat_{year}_{month:02d}_GP.tif"
+            gap_cube = load_and_align_gapfilled_scene(gapfilled_path, target_profile)
+            selected_data = gap_cube
+            source_type = "GAPFILLED"
+            
+            # Gap-filled naming convention: landsat_YYYY_MM_GP.tif
+            compiled_filename = f"landsat_{year}_{month:02d}_GP.tif"
 
         elif raw_path is not None:
             # Fallback to raw if gapfilled file is missing
