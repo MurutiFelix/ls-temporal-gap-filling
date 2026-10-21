@@ -2,7 +2,8 @@
 
 """
 Comprehensive Multi-Sensor NDVI Cross-Validation Pipeline.
-Evaluates Landsat (Gap-Filled and Compiled Raw) against MODIS and AVHRR benchmarks strictly INSIDE the AOI Catchment Boundary.
+Evaluates Landsat (Gap-Filled and Compiled Baseline) against MODIS and AVHRR benchmarks 
+strictly INSIDE the AOI Catchment Boundary.
 """
 
 import gc
@@ -29,9 +30,20 @@ AVHRR_DIR = ROOT_DIR / "data" / "avhrr"
 SHAPEFILE_PATH = ROOT_DIR / "Delineated_Watershade_final_ExportFeatures.shp"
 RESULTS_CSV = ROOT_DIR / "outputs" / "ndvi_correlation_results.csv"
 
+# Global cache for dynamic AOI masks to avoid redundant disk I/O
+MASK_CACHE: Dict[Tuple[int, int, str], np.ndarray] = {}
+
 
 def get_aoi_mask(target_profile: dict) -> np.ndarray:
-    """Rasterizes catchment shapefile into a boolean mask (True strictly inside AOI)."""
+    """Generates or retrieves a cached boolean mask matching the exact profile grid."""
+    cache_key = (
+        target_profile["height"],
+        target_profile["width"],
+        str(target_profile.get("crs")),
+    )
+    if cache_key in MASK_CACHE:
+        return MASK_CACHE[cache_key]
+
     shp_path = SHAPEFILE_PATH
     if not shp_path.exists():
         found = list(ROOT_DIR.rglob("*.shp"))
@@ -41,8 +53,7 @@ def get_aoi_mask(target_profile: dict) -> np.ndarray:
             raise FileNotFoundError("AOI Catchment Shapefile not found in workspace.")
 
     aoi_gdf = gpd.read_file(shp_path)
-    
-    # Reproject shapefile to match raster CRS if necessary
+
     if aoi_gdf.crs != target_profile["crs"]:
         aoi_gdf = aoi_gdf.to_crs(target_profile["crs"])
 
@@ -54,6 +65,7 @@ def get_aoi_mask(target_profile: dict) -> np.ndarray:
         dtype=np.uint8,
     ) == 1
 
+    MASK_CACHE[cache_key] = aoi_mask
     return aoi_mask
 
 
@@ -64,8 +76,16 @@ def load_or_compute_ndvi(tif_path: Path) -> Tuple[np.ndarray, dict]:
         if src.count == 1:
             ndvi = src.read(1).astype(np.float32)
         else:
+            # Model Config order: [Red (0), Green (1), Blue (2), NIR (3), SWIR1 (4), SWIR2 (5), Thermal (6)]
             red = src.read(1).astype(np.float32)
             nir = src.read(4).astype(np.float32)
+
+            # Auto-scale reflectance if integer 0-10000
+            if np.nanmedian(red[red > 0]) > 1.0:
+                red = red / 10000.0
+            if np.nanmedian(nir[nir > 0]) > 1.0:
+                nir = nir / 10000.0
+
             denom = nir + red
             with np.errstate(divide="ignore", invalid="ignore"):
                 ndvi = np.where(denom > 1e-4, (nir - red) / denom, np.nan)
@@ -74,15 +94,16 @@ def load_or_compute_ndvi(tif_path: Path) -> Tuple[np.ndarray, dict]:
 
 
 def evaluate_ndvi_pair(
-    landsat_path: Path, ref_path: Path, sensor_name: str, scene_type: str, aoi_mask: np.ndarray
+    landsat_path: Path, ref_path: Path, sensor_name: str, scene_type: str
 ) -> dict:
-    """Reprojects reference NDVI to Landsat grid and computes r, RMSE, and SSIM strictly inside AOI mask."""
+    """Reprojects reference NDVI to Landsat grid and computes metrics strictly inside AOI."""
     ls_ndvi, ls_profile = load_or_compute_ndvi(landsat_path)
+    aoi_mask = get_aoi_mask(ls_profile)
 
     with rasterio.open(ref_path) as src_ref:
         ref_raw = src_ref.read(1).astype(np.float32)
 
-        # Scale check for reference integer rasters (e.g. MODIS scaled by 10,000)
+        # Handle integer scaling (MODIS / AVHRR scaled by 10,000)
         if np.nanmedian(ref_raw[ref_raw > 0]) > 1.0:
             ref_raw = ref_raw / 10000.0
 
@@ -97,7 +118,7 @@ def evaluate_ndvi_pair(
             resampling=Resampling.bilinear,
         )
 
-    # Valid mask: STRICTLY INSIDE AOI + Finite Reflectance Values
+    # Valid mask: STRICTLY INSIDE AOI + Finite Valid Values
     valid = (
         aoi_mask
         & np.isfinite(ls_ndvi)
@@ -112,7 +133,6 @@ def evaluate_ndvi_pair(
     ls_v = ls_ndvi[valid]
     ref_v = ref_resampled[valid]
 
-    # Zero variance safeguard
     std_ls = np.std(ls_v)
     std_ref = np.std(ref_v)
 
@@ -124,7 +144,6 @@ def evaluate_ndvi_pair(
 
     rmse_val = float(np.sqrt(np.mean((ls_v - ref_v) ** 2)))
 
-    # Fill neutral median for 2D SSIM calculation
     ls_2d = np.where(valid, ls_ndvi, np.nanmedian(ls_v))
     ref_2d = np.where(valid, ref_resampled, np.nanmedian(ref_v))
     ssim_val = float(ssim(ls_2d, ref_2d, data_range=2.0))
@@ -178,57 +197,27 @@ def main():
     print(f"Indexed {len(avhrr_map)} AVHRR reference files (1995_01 to 2022_05).")
     print(f"Indexed {len(modis_map)} MODIS reference files (2000_02 to 2025_12).\n")
 
-    # Generate reference AOI mask using reference profile
-    sample_file = list(GAPFILLED_DIR.glob("*.tif"))[0]
-    with rasterio.open(sample_file) as src:
-        target_profile = src.profile.copy()
-    aoi_mask = get_aoi_mask(target_profile)
-    print(f"Calculated AOI mask containing {np.sum(aoi_mask):,} catchment pixels.\n")
-
     results = []
 
-    # 1. EVALUATE GAP-FILLED OUTPUTS
-    gapfilled_files = list(GAPFILLED_DIR.glob("*NDVI*.tif")) + list(GAPFILLED_DIR.glob("*ndvi*.tif"))
-    if not gapfilled_files:
-        gapfilled_files = list(GAPFILLED_DIR.glob("*.tif"))
+    # 1. EVALUATE COMPILED DATASET (outputs/compiled/)
+    compiled_files = list(COMPILED_DIR.glob("*.tif")) + list(COMPILED_DIR.glob("*.tiff"))
+    print(f"Evaluating {len(compiled_files)} compiled scenes in outputs/compiled/...")
 
-    print(f"Evaluating {len(gapfilled_files)} gap-filled files in outputs/gapfilled/...")
-
-    for gf_path in gapfilled_files:
-        match = re.search(r"_(\d{4})_(\d{1,2})", gf_path.stem)
+    for c_path in compiled_files:
+        match = re.search(r"_(\d{4})_(\d{1,2})", c_path.stem)
         if not match:
             continue
         key = (int(match.group(1)), int(match.group(2)))
 
+        scene_type = "Compiled_Raw" if c_path.stem.endswith("_R") else "Compiled_GapFilled"
+
         if key in avhrr_map:
-            res = evaluate_ndvi_pair(gf_path, avhrr_map[key], "AVHRR", "GapFilled", aoi_mask)
+            res = evaluate_ndvi_pair(c_path, avhrr_map[key], "AVHRR", scene_type)
             if res:
                 results.append(res)
 
         if key in modis_map:
-            res = evaluate_ndvi_pair(gf_path, modis_map[key], "MODIS", "GapFilled", aoi_mask)
-            if res:
-                results.append(res)
-        
-        gc.collect()
-
-    # 2. EVALUATE COMPILED RAW SCENES
-    compiled_raw_files = list(COMPILED_DIR.glob("*_R.tif"))
-    print(f"Evaluating {len(compiled_raw_files)} raw baseline scenes in outputs/compiled/...")
-
-    for raw_path in compiled_raw_files:
-        match = re.search(r"_(\d{4})_(\d{1,2})", raw_path.stem)
-        if not match:
-            continue
-        key = (int(match.group(1)), int(match.group(2)))
-
-        if key in avhrr_map:
-            res = evaluate_ndvi_pair(raw_path, avhrr_map[key], "AVHRR", "Compiled_Raw", aoi_mask)
-            if res:
-                results.append(res)
-
-        if key in modis_map:
-            res = evaluate_ndvi_pair(raw_path, modis_map[key], "MODIS", "Compiled_Raw", aoi_mask)
+            res = evaluate_ndvi_pair(c_path, modis_map[key], "MODIS", scene_type)
             if res:
                 results.append(res)
 
