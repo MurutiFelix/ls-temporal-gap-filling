@@ -160,7 +160,7 @@ def load_model_and_scalers(config: Dict, root_dir: Path):
 
     scalers = joblib.load(scaler_path)
 
-    # Use .ravel() to convert (1, 21) and (1, 7) arrays into 1D (21,) and (7,) vectors
+    # Use .ravel() to convert (1, 21) and (1, 7) 2D arrays into 1D (21,) and (7,) vectors
     x_mean = np.asarray(scalers["x_mean"], dtype=np.float32).ravel()
     x_std = np.asarray(scalers["x_std"], dtype=np.float32).ravel()
     y_mean = np.asarray(scalers["y_mean"], dtype=np.float32).ravel()
@@ -279,14 +279,28 @@ def blend_ground_truth_and_predictions(
     if target_cube is None or not np.any(real_obs_mask_2d):
         return prediction_cube
 
-    dist_inside = distance_transform_edt(real_obs_mask_2d)
-    weight_map = np.clip(dist_inside / float(blend_width_pixels), 0.0, 1.0)
-    weight_map = gaussian_filter(weight_map, sigma=1.5)
-
-    weight_3d = np.repeat(weight_map[np.newaxis, :, :], 7, axis=0)
+    # Clean NaNs in both arrays prior to arithmetic blending
     target_clean = np.nan_to_num(target_cube, nan=0.0)
+    pred_clean = np.nan_to_num(prediction_cube, nan=0.0)
 
-    blended = (target_clean * weight_3d) + (prediction_cube * (1.0 - weight_3d))
+    # Compute Euclidean distance map inside valid real observations
+    dist_inside = distance_transform_edt(real_obs_mask_2d)
+
+    # Smooth weight map: 1.0 deep inside target observations, tapering down to 0.0 outside
+    weight_map = np.clip(dist_inside / float(blend_width_pixels), 0.0, 1.0)
+    weight_map = gaussian_filter(weight_map, sigma=1.0)
+
+    # Broadcast weight map across all 7 spectral bands
+    weight_3d = np.repeat(weight_map[np.newaxis, :, :], 7, axis=0)
+
+    # Perform linear distance-feathered blending
+    blended = (target_clean * weight_3d) + (pred_clean * (1.0 - weight_3d))
+
+    # Explicitly force exact target observations where coverage is solid (> 10px inside boundary)
+    core_obs_mask = dist_inside >= blend_width_pixels
+    for b in range(7):
+        blended[b, core_obs_mask] = target_clean[b, core_obs_mask]
+
     return blended
 
 
@@ -400,8 +414,17 @@ def process_gap_month(
     valid_aoi_pixels = np.sum(real_obs_mask)
     coverage_pct = (valid_aoi_pixels / max(total_aoi_pixels, 1)) * 100.0
 
+    # Leave scene alone if coverage >= threshold_pct (save raw target clean to disk)
     if coverage_pct >= threshold_pct:
-        print(f"[{year}-{month:02d}] AOI Coverage ({coverage_pct:.2f}%) >= {threshold_pct}%. Skipping gap-filling.")
+        print(f"[{year}-{month:02d}] AOI Coverage ({coverage_pct:.2f}%) >= {threshold_pct}%. Leaving scene alone.")
+        if target_cube is not None:
+            reconstructed_cube = target_cube.copy()
+            reconstructed_cube[:, ~aoi_mask] = np.nan
+            ndvi = derive_ndvi(reconstructed_cube)
+            band_output_path = output_dir / f"landsat_{year}_{month:02d}_rbfn_gapfilled.tif"
+            ndvi_output_path = output_dir / f"ndvi_{year}_{month:02d}_rbfn_gapfilled.tif"
+            write_raster(band_output_path, reconstructed_cube, target_profile, output_nodata)
+            write_raster(ndvi_output_path, ndvi, target_profile, output_nodata)
         return False
 
     try:
