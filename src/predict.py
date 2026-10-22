@@ -159,11 +159,25 @@ def load_model_and_scalers(config: Dict, root_dir: Path):
     model.eval()
 
     scalers = joblib.load(scaler_path)
-    x_mean = np.asarray(scalers["x_mean"], dtype=np.float32).copy()
-    x_std = np.asarray(scalers["x_std"], dtype=np.float32).copy()
-    y_mean = np.asarray(scalers["y_mean"], dtype=np.float32).copy()
-    y_std = np.asarray(scalers["y_std"], dtype=np.float32).copy()
+    x_mean = np.atleast_1d(np.asarray(scalers["x_mean"], dtype=np.float32)).copy()
+    x_std = np.atleast_1d(np.asarray(scalers["x_std"], dtype=np.float32)).copy()
+    y_mean = np.atleast_1d(np.asarray(scalers["y_mean"], dtype=np.float32)).copy()
+    y_std = np.atleast_1d(np.asarray(scalers["y_std"], dtype=np.float32)).copy()
 
+    # Expand 1D scalar to 21-feature vector if scaler was saved as single mean/std
+    if x_mean.size != EXPECTED_IN_FEATURES:
+        x_mean = np.full((EXPECTED_IN_FEATURES,), x_mean[0] if x_mean.size > 0 else 0.0, dtype=np.float32)
+
+    if x_std.size != EXPECTED_IN_FEATURES:
+        x_std = np.full((EXPECTED_IN_FEATURES,), x_std[0] if x_std.size > 0 else 1.0, dtype=np.float32)
+
+    if y_mean.size != EXPECTED_OUT_FEATURES:
+        y_mean = np.full((EXPECTED_OUT_FEATURES,), y_mean[0] if y_mean.size > 0 else 0.0, dtype=np.float32)
+
+    if y_std.size != EXPECTED_OUT_FEATURES:
+        y_std = np.full((EXPECTED_OUT_FEATURES,), y_std[0] if y_std.size > 0 else 1.0, dtype=np.float32)
+
+    # Zero-out shift and unit-scale availability flag indices safely
     x_mean[PREV_AVAILABLE_INDEX] = 0.0
     x_mean[NEXT_AVAILABLE_INDEX] = 0.0
     x_std[PREV_AVAILABLE_INDEX] = 1.0
