@@ -414,17 +414,9 @@ def process_gap_month(
     valid_aoi_pixels = np.sum(real_obs_mask)
     coverage_pct = (valid_aoi_pixels / max(total_aoi_pixels, 1)) * 100.0
 
-    # Leave scene alone if coverage >= threshold_pct (save raw target clean to disk)
+    # Strictly skip scenes with >= 80% coverage without writing any files
     if coverage_pct >= threshold_pct:
-        print(f"[{year}-{month:02d}] AOI Coverage ({coverage_pct:.2f}%) >= {threshold_pct}%. Leaving scene alone.")
-        if target_cube is not None:
-            reconstructed_cube = target_cube.copy()
-            reconstructed_cube[:, ~aoi_mask] = np.nan
-            ndvi = derive_ndvi(reconstructed_cube)
-            band_output_path = output_dir / f"landsat_{year}_{month:02d}_rbfn_gapfilled.tif"
-            ndvi_output_path = output_dir / f"ndvi_{year}_{month:02d}_rbfn_gapfilled.tif"
-            write_raster(band_output_path, reconstructed_cube, target_profile, output_nodata)
-            write_raster(ndvi_output_path, ndvi, target_profile, output_nodata)
+        print(f"[{year}-{month:02d}] AOI Coverage ({coverage_pct:.2f}%) >= {threshold_pct}%. Skipping gap-filling.")
         return False
 
     try:
@@ -473,7 +465,7 @@ def process_gap_month(
             fallback_vals = np.where(neighbor_avg > 0, neighbor_avg, y_mean)
             prediction_physical[fallback_mask] = fallback_vals[fallback_mask]
 
-    # D. Spatial Nearest-Neighbor Inpainting Safeguard
+    # D. Spatial Nearest-Neighbor Inplanting Safeguard
     unfilled_aoi = aoi_mask_flat & (~np.all(np.isfinite(prediction_physical), axis=1))
     if np.any(unfilled_aoi):
         filled_aoi = aoi_mask_flat & np.all(np.isfinite(prediction_physical), axis=1)
