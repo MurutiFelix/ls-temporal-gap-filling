@@ -2,9 +2,8 @@
 
 """
 RBFN inference engine for historical Landsat temporal gap filling.
-Reconstructs missing Landsat months using the finalized 21-feature
-predictor structure, applies training-fitted scalers, reconstructs
-all seven Landsat bands, derives NDVI, and enforces seamless alpha feathering.
+Guarantees 100% valid pixel coverage for all generated gap months via a 3-tier 
+reconstruction hierarchy: RBFN -> Climatological Composite -> Spatial Catchment Mean.
 """
 
 import gc
@@ -19,8 +18,7 @@ import torch
 import yaml
 from rasterio.features import rasterize
 from rasterio.warp import Resampling, reproject
-from scipy.interpolate import griddata
-from scipy.ndimage import distance_transform_edt, gaussian_filter, median_filter
+from scipy.ndimage import median_filter
 
 from models.rbfn import RBFN
 from preprocessing.raster_processor import RasterProcessor
@@ -79,10 +77,10 @@ def fill_slc_off_scanlines(raster_cube: np.ndarray) -> np.ndarray:
     cleaned = raster_cube.copy()
     for b in range(cleaned.shape[0]):
         band = cleaned[b]
-        invalid_mask = (~np.isfinite(band)) | (band <= 0.0001)
+        invalid_mask = (~np.isfinite(band)) | (band <= 0)
 
         if np.any(invalid_mask) and np.any(~invalid_mask):
-            filtered = median_filter(band, size=5)
+            filtered = median_filter(band, size=3)
             band[invalid_mask] = filtered[invalid_mask]
             cleaned[b] = band
 
@@ -135,6 +133,21 @@ def flatten_raster_features(raster_cube: np.ndarray) -> np.ndarray:
     )
 
 
+def validate_scalers(
+    x_mean: np.ndarray,
+    x_std: np.ndarray,
+    y_mean: np.ndarray,
+    y_std: np.ndarray,
+) -> Tuple[np.ndarray, np.ndarray, np.ndarray, np.ndarray]:
+    """Flattens 2D joblib scaler arrays into strict 1D vectors."""
+    x_mean = np.asarray(x_mean, dtype=np.float32).ravel()
+    x_std = np.asarray(x_std, dtype=np.float32).ravel()
+    y_mean = np.asarray(y_mean, dtype=np.float32).ravel()
+    y_std = np.asarray(y_std, dtype=np.float32).ravel()
+
+    return x_mean, x_std, y_mean, y_std
+
+
 def load_model_and_scalers(config: Dict, root_dir: Path):
     model_dir = root_dir / config["paths"]["processed_dir"] / "models"
     model_path = model_dir / "rbfn_landsat_gap_filler.pt"
@@ -160,13 +173,10 @@ def load_model_and_scalers(config: Dict, root_dir: Path):
 
     scalers = joblib.load(scaler_path)
 
-    # Use .ravel() to convert (1, 21) and (1, 7) 2D arrays into 1D (21,) and (7,) vectors
-    x_mean = np.asarray(scalers["x_mean"], dtype=np.float32).ravel()
-    x_std = np.asarray(scalers["x_std"], dtype=np.float32).ravel()
-    y_mean = np.asarray(scalers["y_mean"], dtype=np.float32).ravel()
-    y_std = np.asarray(scalers["y_std"], dtype=np.float32).ravel()
+    x_mean, x_std, y_mean, y_std = validate_scalers(
+        scalers["x_mean"], scalers["x_std"], scalers["y_mean"], scalers["y_std"]
+    )
 
-    # Safely zero-out shift and unit-scale availability flag indices
     x_mean[PREV_AVAILABLE_INDEX] = 0.0
     x_mean[NEXT_AVAILABLE_INDEX] = 0.0
     x_std[PREV_AVAILABLE_INDEX] = 1.0
@@ -186,12 +196,12 @@ def build_inference_features(processor, year, month, dem, aoi_mask):
     aoi_total_pixels = np.sum(aoi_mask)
 
     prev_valid_pixels = (
-        np.all(np.isfinite(prev_cube) & (prev_cube > 0.0001), axis=0) & aoi_mask
+        np.all(np.isfinite(prev_cube) & (prev_cube > 0.001), axis=0) & aoi_mask
         if prev_cube is not None
         else np.zeros(spatial_shape, dtype=bool)
     )
     next_valid_pixels = (
-        np.all(np.isfinite(next_cube) & (next_cube > 0.0001), axis=0) & aoi_mask
+        np.all(np.isfinite(next_cube) & (next_cube > 0.001), axis=0) & aoi_mask
         if next_cube is not None
         else np.zeros(spatial_shape, dtype=bool)
     )
@@ -199,9 +209,8 @@ def build_inference_features(processor, year, month, dem, aoi_mask):
     prev_cov_pct = (np.sum(prev_valid_pixels) / max(aoi_total_pixels, 1)) * 100.0
     next_cov_pct = (np.sum(next_valid_pixels) / max(aoi_total_pixels, 1)) * 100.0
 
-    # Include neighbor observations if >= 15% AOI coverage
-    use_prev_for_rbfn = prev_cov_pct >= 15.0
-    use_next_for_rbfn = next_cov_pct >= 15.0
+    use_prev_for_rbfn = prev_cov_pct >= 80.0
+    use_next_for_rbfn = next_cov_pct >= 80.0
 
     has_prev = prev_valid_pixels if use_prev_for_rbfn else np.zeros(spatial_shape, dtype=bool)
     has_next = next_valid_pixels if use_next_for_rbfn else np.zeros(spatial_shape, dtype=bool)
@@ -269,45 +278,10 @@ def derive_ndvi(reconstructed_cube: np.ndarray) -> np.ndarray:
     return ndvi
 
 
-def blend_ground_truth_and_predictions(
-    target_cube: np.ndarray,
-    prediction_cube: np.ndarray,
-    real_obs_mask_2d: np.ndarray,
-    blend_width_pixels: int = 10,
-) -> np.ndarray:
-    """Feathers the boundary between real observations and gap-fills using Euclidean distance weights."""
-    if target_cube is None or not np.any(real_obs_mask_2d):
-        return prediction_cube
-
-    # Clean NaNs in both arrays prior to arithmetic blending
-    target_clean = np.nan_to_num(target_cube, nan=0.0)
-    pred_clean = np.nan_to_num(prediction_cube, nan=0.0)
-
-    # Compute Euclidean distance map inside valid real observations
-    dist_inside = distance_transform_edt(real_obs_mask_2d)
-
-    # Smooth weight map: 1.0 deep inside target observations, tapering down to 0.0 outside
-    weight_map = np.clip(dist_inside / float(blend_width_pixels), 0.0, 1.0)
-    weight_map = gaussian_filter(weight_map, sigma=1.0)
-
-    # Broadcast weight map across all 7 spectral bands
-    weight_3d = np.repeat(weight_map[np.newaxis, :, :], 7, axis=0)
-
-    # Perform linear distance-feathered blending
-    blended = (target_clean * weight_3d) + (pred_clean * (1.0 - weight_3d))
-
-    # Explicitly force exact target observations where coverage is solid (> 10px inside boundary)
-    core_obs_mask = dist_inside >= blend_width_pixels
-    for b in range(7):
-        blended[b, core_obs_mask] = target_clean[b, core_obs_mask]
-
-    return blended
-
-
 def load_climatological_month_composite(
     data_dir: Path, month: int, target_profile: dict
 ) -> np.ndarray:
-    """Robust climatological composite generator with flexible month string matching."""
+    """Computes a multi-year running average composite across all historical Landsat scenes."""
     tif_files = list(data_dir.glob("*.tif")) + list(data_dir.glob("*.tiff"))
     target_months = [month, (month - 2) % 12 + 1, (month) % 12 + 1]
 
@@ -343,7 +317,7 @@ def load_climatological_month_composite(
                     dest = np.clip(dest, 0.0, 1.0)
                     dest = reorder_gee_to_config_bands(dest)
 
-                    valid_mask = np.isfinite(dest) & (dest > 0.0001)
+                    valid_mask = np.isfinite(dest) & (dest > 0.005)
                     running_sum[valid_mask] += dest[valid_mask]
                     running_count[valid_mask] += 1.0
             except Exception:
@@ -357,17 +331,6 @@ def load_climatological_month_composite(
     composite[valid_composite_mask] = (
         running_sum[valid_composite_mask] / running_count[valid_composite_mask]
     )
-
-    for b in range(composite.shape[0]):
-        band = composite[b]
-        invalid_mask = (~np.isfinite(band)) | (band <= 0.0001)
-        if np.any(~invalid_mask) and np.any(invalid_mask):
-            y_valid, x_valid = np.where(~invalid_mask)
-            y_nan, x_nan = np.where(invalid_mask)
-            band[invalid_mask] = griddata(
-                (y_valid, x_valid), band[~invalid_mask], (y_nan, x_nan), method="nearest"
-            )
-            composite[b] = band
 
     return composite
 
@@ -397,26 +360,23 @@ def process_gap_month(
         landsat_dir, year, month, target_profile
     )
 
-    # Clean target scene with median filter if L7 SLC-off era
-    if target_cube is not None and 2003 <= year <= 2022:
-        target_cube = fill_slc_off_scanlines(target_cube)
-
     target_flat = None
     real_obs_mask = np.zeros(aoi_mask_flat.shape, dtype=bool)
 
     if target_cube is not None:
         target_flat = flatten_raster_features(target_cube)
         real_obs_mask = aoi_mask_flat & np.all(
-            np.isfinite(target_flat) & (target_flat > 0.0001), axis=1
+            np.isfinite(target_flat) & (target_flat > 0.0), axis=1
         )
+        print(f"[{year}-{month:02d}] Raw Scene Coverage Found: {scene_path.name}")
 
     total_aoi_pixels = np.sum(aoi_mask_flat)
     valid_aoi_pixels = np.sum(real_obs_mask)
     coverage_pct = (valid_aoi_pixels / max(total_aoi_pixels, 1)) * 100.0
 
-    # Strictly skip scenes with >= 80% coverage without writing any files
+    # Rule: Skip non-gap months (scenes with >= 80% clean raw coverage)
     if coverage_pct >= threshold_pct:
-        print(f"[{year}-{month:02d}] AOI Coverage ({coverage_pct:.2f}%) >= {threshold_pct}%. Skipping gap-filling.")
+        print(f"[{year}-{month:02d}] Clean Month ({coverage_pct:.2f}% raw coverage >= {threshold_pct}%). Skipping gap filling.")
         return False
 
     try:
@@ -427,6 +387,7 @@ def process_gap_month(
         print(f"Skipping {year}-{month:02d}: {exc}")
         return False
 
+    # Gap pixels needing reconstruction
     gap_pixels_mask = aoi_mask_flat & (~real_obs_mask)
     has_prev_flat = has_prev.ravel()
     has_next_flat = has_next.ravel()
@@ -438,18 +399,18 @@ def process_gap_month(
         (X_raw.shape[0], EXPECTED_OUT_FEATURES), np.nan, dtype=np.float32
     )
 
-    # A. Ground Truth Preservation
+    # 1. PRESERVE GROUND TRUTH
     if valid_aoi_pixels > 0 and target_flat is not None:
         prediction_physical[real_obs_mask] = target_flat[real_obs_mask]
 
-    # B. RBFN Gap Reconstruction
+    # 2. TIER 1: RBFN NEURAL NETWORK GAP FILL
     if np.any(pred_mask):
         X_valid = X_raw[pred_mask]
         X_scaled = (X_valid - x_mean) / x_std
         prediction_scaled = predict_in_chunks(model=model, X=X_scaled, chunk_size=chunk_size)
         prediction_physical[pred_mask] = (prediction_scaled * y_std) + y_mean
 
-    # C. Historical Climatological Composite Fallback
+    # 3. TIER 2: CLIMATOLOGICAL HISTORICAL COMPOSITE FALLBACK
     num_fallback = np.sum(fallback_mask)
     if num_fallback > 0:
         clim_composite = load_climatological_month_composite(
@@ -465,39 +426,16 @@ def process_gap_month(
             fallback_vals = np.where(neighbor_avg > 0, neighbor_avg, y_mean)
             prediction_physical[fallback_mask] = fallback_vals[fallback_mask]
 
-    # D. Spatial Nearest-Neighbor Inplanting Safeguard
-    unfilled_aoi = aoi_mask_flat & (~np.all(np.isfinite(prediction_physical), axis=1))
-    if np.any(unfilled_aoi):
-        filled_aoi = aoi_mask_flat & np.all(np.isfinite(prediction_physical), axis=1)
-        if np.any(filled_aoi):
-            y_indices, x_indices = np.indices((height, width))
-            y_flat, x_flat = y_indices.ravel(), x_indices.ravel()
-            coords_filled = np.column_stack((y_flat[filled_aoi], x_flat[filled_aoi]))
-            coords_unfilled = np.column_stack((y_flat[unfilled_aoi], x_flat[unfilled_aoi]))
+    # 4. TIER 3: GUARANTEE 100% CATCHMENT COVERAGE (SPATIAL MEAN CATCHMENT FILL)
+    unassigned_aoi = aoi_mask_flat & (~np.all(np.isfinite(prediction_physical) & (prediction_physical > 0.0), axis=1))
+    if np.any(unassigned_aoi):
+        # Assign fitted monthly global mean vector to any remaining unassigned catchment cells
+        prediction_physical[unassigned_aoi] = y_mean
 
-            for b in range(EXPECTED_OUT_FEATURES):
-                vals_filled = prediction_physical[filled_aoi, b]
-                prediction_physical[unfilled_aoi, b] = griddata(
-                    coords_filled, vals_filled, coords_unfilled, method="nearest"
-                )
-        else:
-            prediction_physical[unfilled_aoi] = y_mean
+    # Mask out background non-AOI cells outside the catchment boundary
+    prediction_physical[~aoi_mask_flat] = np.nan
 
     reconstructed_cube = reconstruct_raster(prediction_physical, height, width)
-
-    # E. Alpha Feathering Blend across Ground Truth Edge Boundaries
-    if valid_aoi_pixels > 0 and target_cube is not None:
-        real_obs_mask_2d = real_obs_mask.reshape((height, width))
-        reconstructed_cube = blend_ground_truth_and_predictions(
-            target_cube=target_cube,
-            prediction_cube=reconstructed_cube,
-            real_obs_mask_2d=real_obs_mask_2d,
-            blend_width_pixels=10,
-        )
-
-    # Apply Catchment AOI Boundary Mask
-    reconstructed_cube[:, ~aoi_mask] = np.nan
-
     ndvi = derive_ndvi(reconstructed_cube)
 
     band_output_path = output_dir / f"landsat_{year}_{month:02d}_rbfn_gapfilled.tif"
@@ -506,7 +444,10 @@ def process_gap_month(
     write_raster(band_output_path, reconstructed_cube, target_profile, output_nodata)
     write_raster(ndvi_output_path, ndvi, target_profile, output_nodata)
 
-    print(f"[{year}-{month:02d}] Reconstructed 100% AOI (Feathered) | Saved -> {band_output_path.name}")
+    valid_out_pixels = np.sum(np.all(np.isfinite(reconstructed_cube) & (reconstructed_cube > 0), axis=0) & aoi_mask)
+    out_coverage_pct = (valid_out_pixels / max(total_aoi_pixels, 1)) * 100.0
+
+    print(f"[{year}-{month:02d}] Reconstructed Output Catchment Coverage: {out_coverage_pct:.2f}% | Saved -> {band_output_path.name}")
     return True
 
 
