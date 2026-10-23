@@ -3,8 +3,9 @@
 """
 RBFN inference engine for historical Landsat temporal gap filling.
 - Skips scenes with >= 80% clean coverage.
-- Uses Extended Temporal Search with Gap-Filled Propagation to pass 
-  fully textured neighbors into the RBFN model.
+- Retains ground truth pixels in target scenes.
+- Uses Extended Temporal Search with Gap-Filled Propagation for RBFN inputs.
+- Uses 30-Year Climatological Monthly Composites as Tier 2 fallback to preserve 2D landscape texture.
 """
 
 import gc
@@ -171,6 +172,63 @@ def find_chained_temporal_neighbor(
                 return raw_cube, float(offset)
 
     return None, 12.0
+
+
+def load_climatological_month_composite(
+    data_dir: Path, month: int, target_profile: dict
+) -> np.ndarray:
+    """Computes a multi-year historical running average composite across all scenes for target month."""
+    tif_files = list(data_dir.glob("*.tif")) + list(data_dir.glob("*.tiff"))
+    target_months = [month, (month - 2) % 12 + 1, (month) % 12 + 1]
+
+    out_h = target_profile["height"]
+    out_w = target_profile["width"]
+
+    running_sum = np.zeros((7, out_h, out_w), dtype=np.float32)
+    running_count = np.zeros((7, out_h, out_w), dtype=np.float32)
+
+    for tif_path in tif_files:
+        stem = tif_path.stem.lower()
+        matches_month = any(
+            f"_{m:02d}_" in stem or f"_{m}_" in stem or stem.endswith(f"_{m:02d}") or stem.endswith(f"_{m}")
+            for m in target_months
+        )
+        if matches_month:
+            try:
+                with rasterio.open(tif_path) as src:
+                    dest = np.zeros((src.count, out_h, out_w), dtype=np.float32)
+                    for b in range(1, src.count + 1):
+                        reproject(
+                            source=rasterio.band(src, b),
+                            destination=dest[b - 1],
+                            src_transform=src.transform,
+                            src_crs=src.crs,
+                            dst_transform=target_profile["transform"],
+                            dst_crs=target_profile["crs"],
+                            resampling=Resampling.nearest,
+                        )
+
+                    if np.nanmax(dest) > 10.0:
+                        dest = dest / 10000.0
+                    dest = np.clip(dest, 0.0, 1.0)
+                    dest = reorder_gee_to_config_bands(dest)
+
+                    valid_mask = np.isfinite(dest) & (dest > 0.005)
+                    running_sum[valid_mask] += dest[valid_mask]
+                    running_count[valid_mask] += 1.0
+            except Exception:
+                continue
+
+    valid_composite_mask = running_count > 0
+    if not np.any(valid_composite_mask):
+        return None
+
+    composite = np.full((7, out_h, out_w), np.nan, dtype=np.float32)
+    composite[valid_composite_mask] = (
+        running_sum[valid_composite_mask] / running_count[valid_composite_mask]
+    )
+
+    return composite
 
 
 def flatten_raster_features(raster_cube: np.ndarray) -> np.ndarray:
@@ -351,21 +409,28 @@ def process_gap_month(
     if valid_aoi_pixels > 0 and target_flat is not None:
         prediction_physical[real_obs_mask] = target_flat[real_obs_mask]
 
-    # B. RBFN NEURAL FILLING VIA CHAINED NEIGHBORS
+    # B. TIER 1: RBFN NEURAL FILLING VIA CHAINED NEIGHBORS
     if np.any(pred_mask):
         X_valid = X[pred_mask]
         X_scaled = (X_valid - x_mean) / x_std
         prediction_scaled = predict_in_chunks(model=model, X=X_scaled, chunk_size=chunk_size)
         prediction_physical[pred_mask] = (prediction_scaled * y_std) + y_mean
 
-    # C. UNASSIGNED FALLBACK (Spatially borrow nearest textured neighbor)
-    unassigned_aoi = aoi_mask_flat & (~np.all(np.isfinite(prediction_physical) & (prediction_physical > 0.0), axis=1))
-    if np.any(unassigned_aoi):
-        prev_flat = X[:, 0:7]
-        next_flat = X[:, 7:14]
-        neighbor_avg = np.where(prev_flat > 0, prev_flat, next_flat)
-        fallback_vals = np.where(neighbor_avg > 0, neighbor_avg, y_mean)
-        prediction_physical[unassigned_aoi] = fallback_vals[unassigned_aoi]
+    # C. TIER 2: CLIMATOLOGICAL MONTHLY COMPOSITE FALLBACK (2D Spatial Texture)
+    num_fallback = np.sum(fallback_mask)
+    if num_fallback > 0:
+        clim_composite = load_climatological_month_composite(
+            data_dir=landsat_dir, month=month, target_profile=target_profile
+        )
+        if clim_composite is not None:
+            clim_flat = flatten_raster_features(clim_composite)
+            prediction_physical[fallback_mask] = clim_flat[fallback_mask]
+        else:
+            prev_flat = X[:, 0:7]
+            next_flat = X[:, 7:14]
+            neighbor_avg = np.where(prev_flat > 0, prev_flat, next_flat)
+            fallback_vals = np.where(neighbor_avg > 0, neighbor_avg, y_mean)
+            prediction_physical[fallback_mask] = fallback_vals[fallback_mask]
 
     # Mask out background non-AOI cells
     prediction_physical[~aoi_mask_flat] = np.nan
