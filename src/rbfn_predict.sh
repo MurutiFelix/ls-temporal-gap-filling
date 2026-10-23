@@ -1,12 +1,12 @@
 #!/bin/bash
-#SBATCH --job-name=rbfn_full_prediction
-#SBATCH --partition=gpu_long
+#SBATCH --job-name=rbfn_tr1
+#SBATCH --partition=gpu1
 #SBATCH --nodes=1
 #SBATCH --ntasks-per-node=1
 #SBATCH --cpus-per-task=16
 #SBATCH --mem=300000
-#SBATCH --gres=gpu:2
-#SBATCH --time=4-00:00:00
+#SBATCH --gres=gpu:1
+#SBATCH --time=1-00:00:00
 #SBATCH --output=logs/rbfn_predict_%j.out
 #SBATCH --error=logs/rbfn_predict_%j.err
 
