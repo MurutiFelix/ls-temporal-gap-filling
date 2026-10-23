@@ -4,8 +4,8 @@
 RBFN inference engine for historical Landsat temporal gap filling.
 - Retains raw ground-truth pixels in target scenes (< 80% coverage).
 - Uses Chained Temporal Search to propagate gap-filled output textures forward.
-- Substitutes missing neighbor feature channels with 2D Climatological Composites 
-  so RBFN always receives complete, realistic 21-feature inputs (never zero-filled).
+- Substitutes missing neighbor feature channels with 2D Climatological Composites.
+- Includes Automated QA Diagnostics to alert on potential flat blocks in SLURM logs.
 """
 
 import gc
@@ -152,7 +152,6 @@ def find_chained_temporal_neighbor(
     Searches backward/forward up to max_search_months:
     1. Checks output_dir for previously gap-filled outputs (_gapfilled.tif) -> 100% complete texture.
     2. Checks data_dir for raw scenes with >= 50% valid coverage.
-    Returns: (cube, dt_months, neighbor_year, neighbor_month)
     """
     step = -1 if direction == "prev" else 1
 
@@ -168,7 +167,6 @@ def find_chained_temporal_neighbor(
             current_m = 1
             current_yr += 1
 
-        # 1. Check if an already gap-filled raster exists
         gf_path = output_dir / f"landsat_{current_yr}_{current_m:02d}_rbfn_gapfilled.tif"
         if gf_path.exists():
             try:
@@ -179,14 +177,12 @@ def find_chained_temporal_neighbor(
             except Exception:
                 pass
 
-        # 2. Check raw scene directory
         raw_cube, raw_path = find_and_load_target_scene(data_dir, current_yr, current_m, target_profile)
         if raw_cube is not None:
             valid_pixels = np.all(np.isfinite(raw_cube) & (raw_cube > 0.0), axis=0)
             if np.mean(valid_pixels) >= 0.50:
                 return raw_cube, float(offset), current_yr, current_m
 
-    # Compute boundary year/month if search exhausted
     fallback_m = (target_month + step * max_search_months - 1) % 12 + 1
     fallback_yr = target_year + (target_month + step * max_search_months - 1) // 12
     return None, float(max_search_months), fallback_yr, fallback_m
@@ -353,6 +349,37 @@ def derive_ndvi(reconstructed_cube: np.ndarray) -> np.ndarray:
     return ndvi
 
 
+def run_flat_block_qa_check(
+    reconstructed_cube: np.ndarray, aoi_mask: np.ndarray, year: int, month: int
+) -> bool:
+    """
+    Performs spatial variance and unique value diagnostics on output raster.
+    Alerts if flat blocks or single value broadcasting is detected.
+    """
+    red_band = reconstructed_cube[RED_INDEX][aoi_mask]
+    valid_red = red_band[np.isfinite(red_band) & (red_band > 0.0)]
+
+    if len(valid_red) == 0:
+        print(f"⚠️ [QA ALERT] [{year}-{month:02d}] Zero valid pixels inside AOI boundary!")
+        return False
+
+    std_dev = np.std(valid_red)
+    unique_count = len(np.unique(np.round(valid_red, decimals=5)))
+
+    if std_dev < 1e-4 or unique_count <= 10:
+        print(
+            f"⚠️ [QA ALERT] [{year}-{month:02d}] FLAT BLOCK DETECTED! "
+            f"StdDev: {std_dev:.6f} | Unique Values: {unique_count:,}"
+        )
+        return False
+
+    print(
+        f"✅ [QA PASS] [{year}-{month:02d}] Spatial Texture Verified. "
+        f"StdDev: {std_dev:.4f} | Unique Values: {unique_count:,}"
+    )
+    return True
+
+
 def process_gap_month(
     processor: RasterProcessor,
     model: RBFN,
@@ -387,19 +414,15 @@ def process_gap_month(
         real_obs_mask = aoi_mask_flat & np.all(
             np.isfinite(target_flat) & (target_flat > 0.0), axis=1
         )
-        print(f"[{year}-{month:02d}] Loaded raw scene from disk: {scene_path.name}")
 
     total_aoi_pixels = np.sum(aoi_mask_flat)
     valid_aoi_pixels = np.sum(real_obs_mask)
     coverage_pct = (valid_aoi_pixels / max(total_aoi_pixels, 1)) * 100.0
 
-    print(f"[{year}-{month:02d}] Calculated AOI Coverage: {coverage_pct:.2f}%")
-
     if coverage_pct >= threshold_pct:
-        print(f"[{year}-{month:02d}] AOI Coverage ({coverage_pct:.2f}%) >= Threshold ({threshold_pct}%). Skipping gap-filling.")
+        print(f"[{year}-{month:02d}] Clean Scene ({coverage_pct:.2f}% >= {threshold_pct}%). Skipping.")
         return False
 
-    # 1. CHAINED SEARCH: Look backward and forward up to 12 months for temporal neighbors
     prev_cube, dt_prev, prev_yr, prev_m = find_chained_temporal_neighbor(
         landsat_dir, output_dir, year, month, "prev", target_profile, max_search_months=12
     )
@@ -407,16 +430,14 @@ def process_gap_month(
         landsat_dir, output_dir, year, month, "next", target_profile, max_search_months=12
     )
 
-    # 2. FEATURE SUBSTITUTION: If neighbor missing after 12 months, substitute 2D Climatology Composite
     if prev_cube is None:
-        print(f"[{year}-{month:02d}] Prev neighbor missing -> Substituting 2D Climatology Composite for month {prev_m:02d}")
+        print(f"[{year}-{month:02d}] Prev missing -> Substituting 2D Climatology Composite ({prev_m:02d})")
         prev_cube = load_climatological_month_composite(landsat_dir, prev_m, target_profile)
 
     if next_cube is None:
-        print(f"[{year}-{month:02d}] Next neighbor missing -> Substituting 2D Climatology Composite for month {next_m:02d}")
+        print(f"[{year}-{month:02d}] Next missing -> Substituting 2D Climatology Composite ({next_m:02d})")
         next_cube = load_climatological_month_composite(landsat_dir, next_m, target_profile)
 
-    # Sanity safeguard for initial cold start
     if prev_cube is None:
         prev_cube = np.repeat(y_mean[:, np.newaxis, np.newaxis], H * W, axis=1).reshape(7, H, W)
     if next_cube is None:
@@ -425,14 +446,13 @@ def process_gap_month(
     prev_clean = fill_slc_off_scanlines(prev_cube)
     next_clean = fill_slc_off_scanlines(next_cube)
 
-    # 3. CONSTRUCT COMPLETE 21-FEATURE MATRIX (Zero-Free Inputs)
     X = np.zeros((H * W, 21), dtype=np.float32)
     X[:, 0:7] = prev_clean.reshape(7, -1).T
     X[:, 7:14] = next_clean.reshape(7, -1).T
     X[:, 14] = dt_prev
     X[:, 15] = dt_next
-    X[:, 16] = 1.0  # Prev availability flag set to valid
-    X[:, 17] = 1.0  # Next availability flag set to valid
+    X[:, 16] = 1.0
+    X[:, 17] = 1.0
     X[:, 18] = processor.load_era5_predictor("precip", year, month).ravel()
     X[:, 19] = processor.load_era5_predictor("temp", year, month).ravel()
     X[:, 20] = dem.ravel()
@@ -443,22 +463,22 @@ def process_gap_month(
         (X.shape[0], EXPECTED_OUT_FEATURES), np.nan, dtype=np.float32
     )
 
-    # A. PRESERVE ORIGINAL RAW GROUND TRUTH PIXELS FIRST
     if valid_aoi_pixels > 0 and target_flat is not None:
         prediction_physical[real_obs_mask] = target_flat[real_obs_mask]
 
-    # B. RBFN NEURAL PREDICTION FOR GAP PIXELS
     if np.any(gap_pixels_mask):
         X_valid = X[gap_pixels_mask]
         X_scaled = (X_valid - x_mean) / x_std
         prediction_scaled = predict_in_chunks(model=model, X=X_scaled, chunk_size=chunk_size)
         prediction_physical[gap_pixels_mask] = (prediction_scaled * y_std) + y_mean
 
-    # Mask out non-AOI background cells
     prediction_physical[~aoi_mask_flat] = np.nan
 
     reconstructed_cube = reconstruct_raster(prediction_physical, height, width)
     ndvi = derive_ndvi(reconstructed_cube)
+
+    # AUTOMATED DIAGNOSTIC CHECK
+    run_flat_block_qa_check(reconstructed_cube, aoi_mask, year, month)
 
     band_output_path = output_dir / f"landsat_{year}_{month:02d}_rbfn_gapfilled.tif"
     ndvi_output_path = output_dir / f"ndvi_{year}_{month:02d}_rbfn_gapfilled.tif"
@@ -466,7 +486,7 @@ def process_gap_month(
     write_raster(band_output_path, reconstructed_cube, target_profile, output_nodata)
     write_raster(ndvi_output_path, ndvi, target_profile, output_nodata)
 
-    print(f"[{year}-{month:02d}] Reconstructed 100% Spatially Textured Output Saved -> {band_output_path.name}")
+    print(f"[{year}-{month:02d}] Reconstructed Output Saved -> {band_output_path.name}")
     return True
 
 
