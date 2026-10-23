@@ -2,10 +2,10 @@
 
 """
 RBFN inference engine for historical Landsat temporal gap filling.
-- Skips scenes with >= 80% clean coverage.
-- Retains ground truth pixels in target scenes.
-- Uses Extended Temporal Search with Gap-Filled Propagation for RBFN inputs.
-- Uses 30-Year Climatological Monthly Composites as Tier 2 fallback to preserve 2D landscape texture.
+- Retains raw ground-truth pixels in target scenes (< 80% coverage).
+- Uses Chained Temporal Search to propagate gap-filled output textures forward.
+- Substitutes missing neighbor feature channels with 2D Climatological Composites 
+  so RBFN always receives complete, realistic 21-feature inputs (never zero-filled).
 """
 
 import gc
@@ -20,6 +20,7 @@ import torch
 import yaml
 from rasterio.features import rasterize
 from rasterio.warp import Resampling, reproject
+from scipy.interpolate import griddata
 from scipy.ndimage import median_filter
 
 from models.rbfn import RBFN
@@ -68,6 +69,17 @@ def reorder_gee_to_config_bands(data: np.ndarray) -> np.ndarray:
 
     gee_to_config = [2, 1, 0, 3, 4, 5, 6]
     return data[gee_to_config, :, :]
+
+
+def normalize_reflectance_range(data: np.ndarray) -> np.ndarray:
+    """Ensures input imagery is strictly within float reflectance 0.0 - 1.0."""
+    if data is None:
+        return None
+
+    if np.nanmax(data) > 10.0:
+        data = data / 10000.0
+
+    return np.clip(data, 0.0, 1.0)
 
 
 def fill_slc_off_scanlines(raster_cube: np.ndarray) -> np.ndarray:
@@ -119,7 +131,9 @@ def find_and_load_target_scene(
                         resampling=Resampling.nearest,
                     )
 
+                destination = normalize_reflectance_range(destination)
                 destination = reorder_gee_to_config_bands(destination)
+
                 return destination, tif_path
 
     return None, None
@@ -133,11 +147,12 @@ def find_chained_temporal_neighbor(
     direction: str,
     target_profile: dict,
     max_search_months: int = 12,
-) -> Tuple[np.ndarray, float]:
+) -> Tuple[np.ndarray, float, int, int]:
     """
     Searches backward/forward up to max_search_months:
     1. Checks output_dir for previously gap-filled outputs (_gapfilled.tif) -> 100% complete texture.
     2. Checks data_dir for raw scenes with >= 50% valid coverage.
+    Returns: (cube, dt_months, neighbor_year, neighbor_month)
     """
     step = -1 if direction == "prev" else 1
 
@@ -160,7 +175,7 @@ def find_chained_temporal_neighbor(
                 with rasterio.open(gf_path) as src:
                     cube = src.read()
                     if cube.shape[0] >= 7 and np.any(np.isfinite(cube) & (cube > 0.0)):
-                        return cube[:7, :, :], float(offset)
+                        return cube[:7, :, :], float(offset), current_yr, current_m
             except Exception:
                 pass
 
@@ -169,15 +184,18 @@ def find_chained_temporal_neighbor(
         if raw_cube is not None:
             valid_pixels = np.all(np.isfinite(raw_cube) & (raw_cube > 0.0), axis=0)
             if np.mean(valid_pixels) >= 0.50:
-                return raw_cube, float(offset)
+                return raw_cube, float(offset), current_yr, current_m
 
-    return None, 12.0
+    # Compute boundary year/month if search exhausted
+    fallback_m = (target_month + step * max_search_months - 1) % 12 + 1
+    fallback_yr = target_year + (target_month + step * max_search_months - 1) // 12
+    return None, float(max_search_months), fallback_yr, fallback_m
 
 
 def load_climatological_month_composite(
     data_dir: Path, month: int, target_profile: dict
 ) -> np.ndarray:
-    """Computes a multi-year historical running average composite across all scenes for target month."""
+    """Computes a multi-year running average composite across historical scenes for target month."""
     tif_files = list(data_dir.glob("*.tif")) + list(data_dir.glob("*.tiff"))
     target_months = [month, (month - 2) % 12 + 1, (month) % 12 + 1]
 
@@ -208,9 +226,7 @@ def load_climatological_month_composite(
                             resampling=Resampling.nearest,
                         )
 
-                    if np.nanmax(dest) > 10.0:
-                        dest = dest / 10000.0
-                    dest = np.clip(dest, 0.0, 1.0)
+                    dest = normalize_reflectance_range(dest)
                     dest = reorder_gee_to_config_bands(dest)
 
                     valid_mask = np.isfinite(dest) & (dest > 0.005)
@@ -227,6 +243,19 @@ def load_climatological_month_composite(
     composite[valid_composite_mask] = (
         running_sum[valid_composite_mask] / running_count[valid_composite_mask]
     )
+
+    for b in range(composite.shape[0]):
+        band = composite[b]
+        invalid_mask = (~np.isfinite(band)) | (band <= 0.005)
+        if np.any(~invalid_mask) and np.any(invalid_mask):
+            y_valid, x_valid = np.where(~invalid_mask)
+            y_nan, x_nan = np.where(invalid_mask)
+            valid_vals = band[~invalid_mask]
+
+            band[invalid_mask] = griddata(
+                (y_valid, x_valid), valid_vals, (y_nan, x_nan), method="nearest"
+            )
+            composite[b] = band
 
     return composite
 
@@ -358,81 +387,74 @@ def process_gap_month(
         real_obs_mask = aoi_mask_flat & np.all(
             np.isfinite(target_flat) & (target_flat > 0.0), axis=1
         )
+        print(f"[{year}-{month:02d}] Loaded raw scene from disk: {scene_path.name}")
 
     total_aoi_pixels = np.sum(aoi_mask_flat)
     valid_aoi_pixels = np.sum(real_obs_mask)
     coverage_pct = (valid_aoi_pixels / max(total_aoi_pixels, 1)) * 100.0
 
-    # Rule 1: Skip clean scenes (>= 80% coverage) completely
+    print(f"[{year}-{month:02d}] Calculated AOI Coverage: {coverage_pct:.2f}%")
+
     if coverage_pct >= threshold_pct:
-        print(f"[{year}-{month:02d}] Clean Scene ({coverage_pct:.2f}% >= {threshold_pct}%). Skipping.")
+        print(f"[{year}-{month:02d}] AOI Coverage ({coverage_pct:.2f}%) >= Threshold ({threshold_pct}%). Skipping gap-filling.")
         return False
 
-    # Rule 2: Extended Temporal Search with Gap-Filled Propagation
-    prev_cube, dt_prev = find_chained_temporal_neighbor(
+    # 1. CHAINED SEARCH: Look backward and forward up to 12 months for temporal neighbors
+    prev_cube, dt_prev, prev_yr, prev_m = find_chained_temporal_neighbor(
         landsat_dir, output_dir, year, month, "prev", target_profile, max_search_months=12
     )
-    next_cube, dt_next = find_chained_temporal_neighbor(
+    next_cube, dt_next, next_yr, next_m = find_chained_temporal_neighbor(
         landsat_dir, output_dir, year, month, "next", target_profile, max_search_months=12
     )
 
-    prev_clean = np.nan_to_num(prev_cube, nan=0.0) if prev_cube is not None else np.zeros((7, H, W), dtype=np.float32)
-    next_clean = np.nan_to_num(next_cube, nan=0.0) if next_cube is not None else np.zeros((7, H, W), dtype=np.float32)
+    # 2. FEATURE SUBSTITUTION: If neighbor missing after 12 months, substitute 2D Climatology Composite
+    if prev_cube is None:
+        print(f"[{year}-{month:02d}] Prev neighbor missing -> Substituting 2D Climatology Composite for month {prev_m:02d}")
+        prev_cube = load_climatological_month_composite(landsat_dir, prev_m, target_profile)
 
-    has_prev = np.all(prev_clean > 0.0, axis=0) & aoi_mask if prev_cube is not None else np.zeros((H, W), dtype=bool)
-    has_next = np.all(next_clean > 0.0, axis=0) & aoi_mask if next_cube is not None else np.zeros((H, W), dtype=bool)
+    if next_cube is None:
+        print(f"[{year}-{month:02d}] Next neighbor missing -> Substituting 2D Climatology Composite for month {next_m:02d}")
+        next_cube = load_climatological_month_composite(landsat_dir, next_m, target_profile)
 
-    # Build 21-feature predictor stack
+    # Sanity safeguard for initial cold start
+    if prev_cube is None:
+        prev_cube = np.repeat(y_mean[:, np.newaxis, np.newaxis], H * W, axis=1).reshape(7, H, W)
+    if next_cube is None:
+        next_cube = np.repeat(y_mean[:, np.newaxis, np.newaxis], H * W, axis=1).reshape(7, H, W)
+
+    prev_clean = fill_slc_off_scanlines(prev_cube)
+    next_clean = fill_slc_off_scanlines(next_cube)
+
+    # 3. CONSTRUCT COMPLETE 21-FEATURE MATRIX (Zero-Free Inputs)
     X = np.zeros((H * W, 21), dtype=np.float32)
     X[:, 0:7] = prev_clean.reshape(7, -1).T
     X[:, 7:14] = next_clean.reshape(7, -1).T
     X[:, 14] = dt_prev
     X[:, 15] = dt_next
-    X[:, 16] = has_prev.ravel().astype(np.float32)
-    X[:, 17] = has_next.ravel().astype(np.float32)
+    X[:, 16] = 1.0  # Prev availability flag set to valid
+    X[:, 17] = 1.0  # Next availability flag set to valid
     X[:, 18] = processor.load_era5_predictor("precip", year, month).ravel()
     X[:, 19] = processor.load_era5_predictor("temp", year, month).ravel()
     X[:, 20] = dem.ravel()
 
     gap_pixels_mask = aoi_mask_flat & (~real_obs_mask)
-    has_prev_flat = has_prev.ravel()
-    has_next_flat = has_next.ravel()
-
-    pred_mask = gap_pixels_mask & (has_prev_flat | has_next_flat)
-    fallback_mask = gap_pixels_mask & ~(has_prev_flat | has_next_flat)
 
     prediction_physical = np.full(
         (X.shape[0], EXPECTED_OUT_FEATURES), np.nan, dtype=np.float32
     )
 
-    # A. PRESERVE GROUND TRUTH PIXELS
+    # A. PRESERVE ORIGINAL RAW GROUND TRUTH PIXELS FIRST
     if valid_aoi_pixels > 0 and target_flat is not None:
         prediction_physical[real_obs_mask] = target_flat[real_obs_mask]
 
-    # B. TIER 1: RBFN NEURAL FILLING VIA CHAINED NEIGHBORS
-    if np.any(pred_mask):
-        X_valid = X[pred_mask]
+    # B. RBFN NEURAL PREDICTION FOR GAP PIXELS
+    if np.any(gap_pixels_mask):
+        X_valid = X[gap_pixels_mask]
         X_scaled = (X_valid - x_mean) / x_std
         prediction_scaled = predict_in_chunks(model=model, X=X_scaled, chunk_size=chunk_size)
-        prediction_physical[pred_mask] = (prediction_scaled * y_std) + y_mean
+        prediction_physical[gap_pixels_mask] = (prediction_scaled * y_std) + y_mean
 
-    # C. TIER 2: CLIMATOLOGICAL MONTHLY COMPOSITE FALLBACK (2D Spatial Texture)
-    num_fallback = np.sum(fallback_mask)
-    if num_fallback > 0:
-        clim_composite = load_climatological_month_composite(
-            data_dir=landsat_dir, month=month, target_profile=target_profile
-        )
-        if clim_composite is not None:
-            clim_flat = flatten_raster_features(clim_composite)
-            prediction_physical[fallback_mask] = clim_flat[fallback_mask]
-        else:
-            prev_flat = X[:, 0:7]
-            next_flat = X[:, 7:14]
-            neighbor_avg = np.where(prev_flat > 0, prev_flat, next_flat)
-            fallback_vals = np.where(neighbor_avg > 0, neighbor_avg, y_mean)
-            prediction_physical[fallback_mask] = fallback_vals[fallback_mask]
-
-    # Mask out background non-AOI cells
+    # Mask out non-AOI background cells
     prediction_physical[~aoi_mask_flat] = np.nan
 
     reconstructed_cube = reconstruct_raster(prediction_physical, height, width)
@@ -444,7 +466,7 @@ def process_gap_month(
     write_raster(band_output_path, reconstructed_cube, target_profile, output_nodata)
     write_raster(ndvi_output_path, ndvi, target_profile, output_nodata)
 
-    print(f"[{year}-{month:02d}] Gap-filled output saved -> {band_output_path.name}")
+    print(f"[{year}-{month:02d}] Reconstructed 100% Spatially Textured Output Saved -> {band_output_path.name}")
     return True
 
 
@@ -483,10 +505,10 @@ def main() -> None:
     dem = processor.load_dem()
     target_profile = processor.get_target_profile()
 
-    output_dir = root_dir / config["paths"]["gapfilled_dir"]
     gap_start, gap_end = config["landsat"]["gap_years"]
     chunk_size = int(config["model"]["rbfn"]["chunk_size"])
     output_nodata = float(config["gap_filling"]["output_nodata"])
+    output_dir = root_dir / config["paths"]["gapfilled_dir"]
 
     for year in range(int(gap_start), int(gap_end) + 1):
         for month in range(1, 13):
@@ -504,6 +526,7 @@ def main() -> None:
                 month=month,
                 chunk_size=chunk_size,
                 output_nodata=output_nodata,
+                threshold_pct=80.0,
             )
             gc.collect()
 
