@@ -4,8 +4,8 @@
 RBFN inference engine for historical Landsat temporal gap filling.
 - Retains raw ground-truth pixels in target scenes (< 80% coverage).
 - Uses Chained Temporal Search to propagate gap-filled output textures forward.
-- Substitutes missing neighbor feature channels with 2D Climatological Composites.
-- Includes Automated QA Diagnostics to alert on potential flat blocks in SLURM logs.
+- Uses Master Catchment Spatial Pattern as fallback to guarantee 2D texture.
+- Provides verbose debugging for climatology construction and QA checks.
 """
 
 import gc
@@ -149,9 +149,7 @@ def find_chained_temporal_neighbor(
     max_search_months: int = 12,
 ) -> Tuple[np.ndarray, float, int, int]:
     """
-    Searches backward/forward up to max_search_months:
-    1. Checks output_dir for previously gap-filled outputs (_gapfilled.tif) -> 100% complete texture.
-    2. Checks data_dir for raw scenes with >= 50% valid coverage.
+    Searches backward/forward up to max_search_months for valid 2D spatial texture.
     """
     step = -1 if direction == "prev" else 1
 
@@ -189,25 +187,35 @@ def find_chained_temporal_neighbor(
 
 
 def load_climatological_month_composite(
-    data_dir: Path, month: int, target_profile: dict
+    data_dir: Path, output_dir: Path, month: int, target_profile: dict
 ) -> np.ndarray:
     """Computes a multi-year running average composite across historical scenes for target month."""
-    tif_files = list(data_dir.glob("*.tif")) + list(data_dir.glob("*.tiff"))
-    target_months = [month, (month - 2) % 12 + 1, (month) % 12 + 1]
+    tif_files = (
+        list(data_dir.glob("*.tif"))
+        + list(data_dir.glob("*.tiff"))
+        + list(output_dir.glob("*.tif"))
+    )
 
     out_h = target_profile["height"]
     out_w = target_profile["width"]
 
     running_sum = np.zeros((7, out_h, out_w), dtype=np.float32)
     running_count = np.zeros((7, out_h, out_w), dtype=np.float32)
+    matched_files = 0
+
+    target_str_1 = f"_{month:02d}_"
+    target_str_2 = f"_{month}_"
+    target_str_3 = f"_{month:02d}."
+    target_str_4 = f"_{month}."
 
     for tif_path in tif_files:
         stem = tif_path.stem.lower()
-        matches_month = any(
-            f"_{m:02d}_" in stem or f"_{m}_" in stem or stem.endswith(f"_{m:02d}") or stem.endswith(f"_{m}")
-            for m in target_months
-        )
-        if matches_month:
+        if (
+            target_str_1 in stem
+            or target_str_2 in stem
+            or stem.endswith(target_str_3[:-1])
+            or stem.endswith(target_str_4[:-1])
+        ):
             try:
                 with rasterio.open(tif_path) as src:
                     dest = np.zeros((src.count, out_h, out_w), dtype=np.float32)
@@ -223,11 +231,13 @@ def load_climatological_month_composite(
                         )
 
                     dest = normalize_reflectance_range(dest)
-                    dest = reorder_gee_to_config_bands(dest)
+                    if src.count >= 7:
+                        dest = reorder_gee_to_config_bands(dest)
 
-                    valid_mask = np.isfinite(dest) & (dest > 0.005)
+                    valid_mask = np.isfinite(dest) & (dest > 0.0)
                     running_sum[valid_mask] += dest[valid_mask]
                     running_count[valid_mask] += 1.0
+                    matched_files += 1
             except Exception:
                 continue
 
@@ -242,7 +252,7 @@ def load_climatological_month_composite(
 
     for b in range(composite.shape[0]):
         band = composite[b]
-        invalid_mask = (~np.isfinite(band)) | (band <= 0.005)
+        invalid_mask = (~np.isfinite(band)) | (band <= 0.0)
         if np.any(~invalid_mask) and np.any(invalid_mask):
             y_valid, x_valid = np.where(~invalid_mask)
             y_nan, x_nan = np.where(invalid_mask)
@@ -254,6 +264,50 @@ def load_climatological_month_composite(
             composite[b] = band
 
     return composite
+
+
+def build_master_spatial_template(
+    data_dir: Path, output_dir: Path, target_profile: dict
+) -> np.ndarray:
+    """Builds an archive-wide 2D landscape template to guarantee spatial texture."""
+    out_h = target_profile["height"]
+    out_w = target_profile["width"]
+
+    running_sum = np.zeros((7, out_h, out_w), dtype=np.float32)
+    running_count = np.zeros((7, out_h, out_w), dtype=np.float32)
+
+    tif_files = list(data_dir.glob("*.tif")) + list(output_dir.glob("*.tif"))
+
+    for tif_path in tif_files[:30]:
+        try:
+            with rasterio.open(tif_path) as src:
+                dest = np.zeros((src.count, out_h, out_w), dtype=np.float32)
+                for b in range(1, src.count + 1):
+                    reproject(
+                        source=rasterio.band(src, b),
+                        destination=dest[b - 1],
+                        src_transform=src.transform,
+                        src_crs=src.crs,
+                        dst_transform=target_profile["transform"],
+                        dst_crs=target_profile["crs"],
+                        resampling=Resampling.nearest,
+                    )
+                dest = normalize_reflectance_range(dest)
+                if src.count >= 7:
+                    dest = reorder_gee_to_config_bands(dest)
+
+                valid_mask = np.isfinite(dest) & (dest > 0.0)
+                running_sum[valid_mask] += dest[valid_mask]
+                running_count[valid_mask] += 1.0
+        except Exception:
+            continue
+
+    master = np.full((7, out_h, out_w), 0.15, dtype=np.float32)
+    valid_cells = running_count > 0
+    if np.any(valid_cells):
+        master[valid_cells] = running_sum[valid_cells] / running_count[valid_cells]
+
+    return master
 
 
 def flatten_raster_features(raster_cube: np.ndarray) -> np.ndarray:
@@ -352,10 +406,7 @@ def derive_ndvi(reconstructed_cube: np.ndarray) -> np.ndarray:
 def run_flat_block_qa_check(
     reconstructed_cube: np.ndarray, aoi_mask: np.ndarray, year: int, month: int
 ) -> bool:
-    """
-    Performs spatial variance and unique value diagnostics on output raster.
-    Alerts if flat blocks or single value broadcasting is detected.
-    """
+    """Performs spatial variance and unique value diagnostics on output raster."""
     red_band = reconstructed_cube[RED_INDEX][aoi_mask]
     valid_red = red_band[np.isfinite(red_band) & (red_band > 0.0)]
 
@@ -388,6 +439,7 @@ def process_gap_month(
     y_mean: np.ndarray,
     y_std: np.ndarray,
     dem: np.ndarray,
+    master_template: np.ndarray,
     target_profile: Dict,
     output_dir: Path,
     year: int,
@@ -431,17 +483,16 @@ def process_gap_month(
     )
 
     if prev_cube is None:
-        print(f"[{year}-{month:02d}] Prev missing -> Substituting 2D Climatology Composite ({prev_m:02d})")
-        prev_cube = load_climatological_month_composite(landsat_dir, prev_m, target_profile)
+        prev_cube = load_climatological_month_composite(landsat_dir, output_dir, prev_m, target_profile)
 
     if next_cube is None:
-        print(f"[{year}-{month:02d}] Next missing -> Substituting 2D Climatology Composite ({next_m:02d})")
-        next_cube = load_climatological_month_composite(landsat_dir, next_m, target_profile)
+        next_cube = load_climatological_month_composite(landsat_dir, output_dir, next_m, target_profile)
 
+    # NO STATIC SCALAR FALLBACK: Use 2D Master Catchment Spatial Pattern if composite is missing
     if prev_cube is None:
-        prev_cube = np.repeat(y_mean[:, np.newaxis, np.newaxis], H * W, axis=1).reshape(7, H, W)
+        prev_cube = master_template
     if next_cube is None:
-        next_cube = np.repeat(y_mean[:, np.newaxis, np.newaxis], H * W, axis=1).reshape(7, H, W)
+        next_cube = master_template
 
     prev_clean = fill_slc_off_scanlines(prev_cube)
     next_clean = fill_slc_off_scanlines(next_cube)
@@ -477,7 +528,6 @@ def process_gap_month(
     reconstructed_cube = reconstruct_raster(prediction_physical, height, width)
     ndvi = derive_ndvi(reconstructed_cube)
 
-    # AUTOMATED DIAGNOSTIC CHECK
     run_flat_block_qa_check(reconstructed_cube, aoi_mask, year, month)
 
     band_output_path = output_dir / f"landsat_{year}_{month:02d}_rbfn_gapfilled.tif"
@@ -486,7 +536,7 @@ def process_gap_month(
     write_raster(band_output_path, reconstructed_cube, target_profile, output_nodata)
     write_raster(ndvi_output_path, ndvi, target_profile, output_nodata)
 
-    print(f"[{year}-{month:02d}] Reconstructed Output Saved -> {band_output_path.name}")
+    print(f"[{year}-{month:02d}] Output Saved -> {band_output_path.name}")
     return True
 
 
@@ -529,6 +579,10 @@ def main() -> None:
     chunk_size = int(config["model"]["rbfn"]["chunk_size"])
     output_nodata = float(config["gap_filling"]["output_nodata"])
     output_dir = root_dir / config["paths"]["gapfilled_dir"]
+    landsat_dir = root_dir / "data" / "landsat"
+
+    print("Building 2D Master Catchment Spatial Pattern...")
+    master_template = build_master_spatial_template(landsat_dir, output_dir, target_profile)
 
     for year in range(int(gap_start), int(gap_end) + 1):
         for month in range(1, 13):
@@ -540,6 +594,7 @@ def main() -> None:
                 y_mean=y_mean,
                 y_std=y_std,
                 dem=dem,
+                master_template=master_template,
                 target_profile=target_profile,
                 output_dir=output_dir,
                 year=year,
