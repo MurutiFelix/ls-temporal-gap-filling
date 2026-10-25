@@ -1,46 +1,156 @@
 # src/predict.py
 
 """
-RBFN inference engine for historical Landsat temporal gap filling.
-- Retains raw ground-truth pixels in target scenes (< 80% coverage).
-- Uses Chained Temporal Search to propagate gap-filled output textures forward.
-- Uses Master Catchment Spatial Pattern as fallback to guarantee 2D texture.
-- Provides verbose debugging for climatology construction and QA checks.
-"""
+RBFN inference engine for historical Landsat temporal gap filling (v2).
 
+Goal: every month in the gap period leaves as a complete, seamless 7-band
+Landsat cube (plus NDVI) with no empty months, no partial months and no
+constant-value blocks.
+
+Fill hierarchy (each AOI pixel is filled by the first stage that can serve it):
+
+  1. OBSERVED     real Landsat pixels of the target month are kept untouched.
+  2. RBFN         gap pixels that have a real previous and/or next Landsat
+                  observation within the search window. Temporal context is
+                  searched PER PIXEL (nearest valid previous / next scene), so
+                  SLC-off stripes, clouds and partial tiles are all handled by
+                  the same rule, and dt_prev / dt_next are per-pixel values
+                  that are zero exactly when the matching availability flag is 0
+                  (the same convention the model was trained with).
+  3. CLIMATOLOGY  pixels with no real observation inside the window (typical
+                  for 1996-1999, where most of the catchment has no Landsat
+                  archive). Uses the per-pixel, 30 m multi-year composite of the
+                  same calendar month built from real scenes, so it keeps real
+                  spatial texture instead of a constant value.
+  4. SPATIAL      any residual pixel that was never observed in any year is
+                  filled from the nearest valid pixel and lightly smoothed.
+
+Why the old script produced empty / partial / blocky months
+-----------------------------------------------------------
+  * A scene-level 80 % coverage gate disabled RBFN for every neighbour that was
+    only partly valid. In 1995-1999 no neighbour reaches 80 %, so RBFN never ran.
+  * Fallback pixels were then taken from y_mean (one constant per band, i.e. a
+    uniform block) because the climatology file search pattern ("_MM_") did not
+    match stems that end in the month, so the composite was always None.
+  * Months with >= 80 % coverage were skipped completely, leaving residual gaps.
+  * Pixels with neither neighbour were still sent to RBFN with ERA5 + DEM only,
+    and ERA5 is a coarse grid, which gives rectangular blocks.
+  * dt_prev / dt_next were non-zero for pixels whose availability flag was 0.
+  * Any NaN in ERA5 / DEM removed the pixel from valid_mask, which is why some
+    months were written completely empty.
+  * Reflectance scaling was applied in the climatology path only, and outputs
+    were never range-checked (hence the repeated 1.6022 maximum).
+
+Extra outputs per month
+-----------------------
+  landsat_YYYY_MM_rbfn_gapfilled.tif        7 bands, config order
+  ndvi_YYYY_MM_rbfn_gapfilled.tif           NDVI
+  provenance/landsat_YYYY_MM_source.tif     uint8: 1 observed, 2 RBFN,
+                                            3 climatology, 4 spatial
+  gapfill_run_summary.csv                   coverage and source shares per month
+"""
+import csv
 import gc
-import joblib
+import re
+import traceback
+from collections import OrderedDict
 from pathlib import Path
-from typing import Dict, Tuple
+from typing import Dict, Optional, Tuple
 
 import geopandas as gpd
+import joblib
 import numpy as np
 import rasterio
 import torch
 import yaml
 from rasterio.features import rasterize
 from rasterio.warp import Resampling, reproject
-from scipy.interpolate import griddata
-from scipy.ndimage import median_filter
+from scipy.ndimage import distance_transform_edt, gaussian_filter
 
 from models.rbfn import RBFN
 from preprocessing.raster_processor import RasterProcessor
 
 EXPECTED_IN_FEATURES = 21
 EXPECTED_OUT_FEATURES = 7
+N_BANDS = 7
+PREVIOUS_BAND_START = 0
+PREVIOUS_BAND_END = 7
+NEXT_BAND_START = 7
+NEXT_BAND_END = 14
+DT_PREV_INDEX = 14
+DT_NEXT_INDEX = 15
 PREV_AVAILABLE_INDEX = 16
 NEXT_AVAILABLE_INDEX = 17
+ERA5_PRECIP_INDEX = 18
+ERA5_TEMP_INDEX = 19
+DEM_INDEX = 20
 RED_INDEX = 0
 NIR_INDEX = 3
+BINARY_FEATURE_INDICES = (
+    PREV_AVAILABLE_INDEX,
+    NEXT_AVAILABLE_INDEX,
+)
+
+# ---------------------------------------------------------------- tunables --
+# Months searched either side of the target for a real observation. Can be
+# overridden with config["gap_filling"]["search_window_months"].
+SEARCH_WINDOW_MONTHS = 12
+# dt is expressed in months (the old script defaulted dt to 12.0). If the model
+# was trained with dt in days, set this to 30.4.
+DT_PER_MONTH = 1.0
+# True: also fill the residual gaps of months that already have >= 80 % real
+# coverage, so every month of the series is complete.
+PROCESS_SUFFICIENT_MONTHS = True
+# Number of full scenes kept in memory (each is 7 x H x W float32).
+SCENE_CACHE_SIZE = 4
+# Output values are clipped to y_mean +/- CLIP_SIGMAS * y_std (lower bound >= 0).
+CLIP_SIGMAS = 8.0
+# Smoothing (pixels) applied only to spatially filled residual pixels.
+SPATIAL_SMOOTH_SIGMA = 3.0
+
+# Provenance codes
+SRC_NONE = 0
+SRC_OBSERVED = 1
+SRC_RBFN = 2
+SRC_CLIMATOLOGY = 3
+SRC_SPATIAL = 4
+
+_SCENE_RE = re.compile(r"_(\d{4})_(\d{1,2})(?!\d)")
 
 
+# ------------------------------------------------------------------ config --
 def load_config(config_path: Path) -> Dict:
     with config_path.open("r", encoding="utf-8") as file:
         return yaml.safe_load(file)
 
 
+# ------------------------------------------------------------ band helpers --
+def reorder_gee_to_config_bands(data: np.ndarray) -> np.ndarray:
+    """
+    Reorders bands from GEE export order [Blue, Green, Red, NIR, SWIR1, SWIR2, Thermal]
+    to model config order [Red, Green, Blue, NIR, SWIR1, SWIR2, Thermal].
+    """
+    if data is None or data.ndim != 3 or data.shape[0] < 7:
+        return data
+    gee_to_config = [2, 1, 0, 3, 4, 5, 6]
+    return data[gee_to_config, :, :]
+
+
+def band_limits(y_mean: np.ndarray, y_std: np.ndarray) -> Tuple[np.ndarray, np.ndarray]:
+    """Physically plausible per-band range derived from the training target scaler."""
+    lo = np.maximum(y_mean - CLIP_SIGMAS * y_std, 0.0).astype(np.float32)
+    hi = (y_mean + CLIP_SIGMAS * y_std).astype(np.float32)
+    return lo, hi
+
+
+def shift_month(year: int, month: int, delta: int) -> Tuple[int, int]:
+    t = year * 12 + (month - 1) + delta
+    return t // 12, t % 12 + 1
+
+
+# -------------------------------------------------------------- AOI + scenes --
 def get_aoi_mask(target_profile: dict) -> np.ndarray:
-    """Rasterizes catchment shapefile to create a boolean mask (True inside AOI)."""
+    """Rasterizes the catchment shapefile to a boolean mask (True inside AOI)."""
     shp_path = Path("Delineated_Watershade_final_ExportFeatures.shp")
     if not shp_path.exists():
         found = list(Path(".").rglob("*.shp"))
@@ -50,6 +160,9 @@ def get_aoi_mask(target_profile: dict) -> np.ndarray:
             raise FileNotFoundError("AOI Shapefile not found in project workspace.")
 
     aoi_gdf = gpd.read_file(shp_path)
+    if aoi_gdf.crs is not None and target_profile.get("crs") is not None:
+        if aoi_gdf.crs != target_profile["crs"]:
+            aoi_gdf = aoi_gdf.to_crs(target_profile["crs"])
 
     aoi_mask = rasterize(
         shapes=[(geom, 1) for geom in aoi_gdf.geometry],
@@ -58,284 +171,172 @@ def get_aoi_mask(target_profile: dict) -> np.ndarray:
         fill=0,
         dtype=np.uint8,
     ) == 1
-
     return aoi_mask
 
 
-def reorder_gee_to_config_bands(data: np.ndarray) -> np.ndarray:
-    """Reorders bands from GEE export order to model config order [Red, Green, Blue, NIR, SWIR1, SWIR2, Thermal]."""
-    if data is None or data.ndim != 3 or data.shape[0] < 7:
+def index_scenes(data_dir: Path) -> Dict[Tuple[int, int], Path]:
+    """Maps (year, month) -> real Landsat GeoTIFF found in data_dir."""
+    index: Dict[Tuple[int, int], Path] = {}
+    files = list(data_dir.glob("*.tif")) + list(data_dir.glob("*.tiff"))
+    for path in sorted(files):
+        match = _SCENE_RE.search(path.stem)
+        if not match:
+            continue
+        year, month = int(match.group(1)), int(match.group(2))
+        if 1 <= month <= 12:
+            index.setdefault((year, month), path)
+    return index
+
+
+class SceneStore:
+    """
+    Loads real Landsat scenes onto the target grid as (7, H, W) float32 cubes in
+    model band order. Invalid pixels are NaN. Scale (0-10000 vs 0-1) is inferred
+    per band from the training target scaler, so every code path is consistent.
+    """
+
+    def __init__(
+        self,
+        index: Dict[Tuple[int, int], Path],
+        target_profile: dict,
+        y_mean: np.ndarray,
+        y_std: np.ndarray,
+        cache_size: int = SCENE_CACHE_SIZE,
+    ) -> None:
+        self.index = index
+        self.profile = target_profile
+        self.y_mean = np.asarray(y_mean, dtype=np.float32)
+        self.lo, self.hi = band_limits(self.y_mean, np.asarray(y_std, dtype=np.float32))
+        self.cache_size = cache_size
+        self._cache: "OrderedDict[Tuple[int, int], Optional[np.ndarray]]" = OrderedDict()
+
+    def _same_grid(self, src) -> bool:
+        p = self.profile
+        if src.height != p["height"] or src.width != p["width"]:
+            return False
+        if src.crs != p["crs"]:
+            return False
+        return bool(
+            np.allclose(
+                tuple(src.transform)[:6], tuple(p["transform"])[:6], rtol=1e-12, atol=1e-9
+            )
+        )
+
+    def _harmonise_scale(self, data: np.ndarray) -> np.ndarray:
+        step = max(1, int(np.sqrt(data.shape[1] * data.shape[2] / 50000.0)))
+        sample = data[:, ::step, ::step]
+        for b in range(N_BANDS):
+            vals = sample[b]
+            vals = vals[np.isfinite(vals) & (vals > 0)]
+            if vals.size < 20 or self.y_mean[b] <= 0:
+                continue
+            if float(np.median(vals)) / float(self.y_mean[b]) > 50.0:
+                data[b] /= 10000.0
         return data
 
-    gee_to_config = [2, 1, 0, 3, 4, 5, 6]
-    return data[gee_to_config, :, :]
-
-
-def normalize_reflectance_range(data: np.ndarray) -> np.ndarray:
-    """Ensures input imagery is strictly within float reflectance 0.0 - 1.0."""
-    if data is None:
-        return None
-
-    if np.nanmax(data) > 10.0:
-        data = data / 10000.0
-
-    return np.clip(data, 0.0, 1.0)
-
-
-def fill_slc_off_scanlines(raster_cube: np.ndarray) -> np.ndarray:
-    """Spatially interpolates narrow SLC-off scanline gaps in Landsat 7 imagery."""
-    if raster_cube is None:
-        return None
-
-    cleaned = raster_cube.copy()
-    for b in range(cleaned.shape[0]):
-        band = cleaned[b]
-        invalid_mask = (~np.isfinite(band)) | (band <= 0)
-
-        if np.any(invalid_mask) and np.any(~invalid_mask):
-            filtered = median_filter(band, size=3)
-            band[invalid_mask] = filtered[invalid_mask]
-            cleaned[b] = band
-
-    return cleaned
-
-
-def find_and_load_target_scene(
-    data_dir: Path, year: int, month: int, target_profile: dict
-) -> Tuple[np.ndarray, Path]:
-    """Scans data_dir for target scene and resamples/reprojects it to target_profile grid."""
-    pattern_str_1 = f"_{year}_{month:02d}"
-    pattern_str_2 = f"_{year}_{month}"
-
-    tif_files = list(data_dir.glob("*.tif")) + list(data_dir.glob("*.tiff"))
-
-    for tif_path in tif_files:
-        stem = tif_path.stem
-        if pattern_str_1 in stem or pattern_str_2 in stem:
-            with rasterio.open(tif_path) as src:
-                out_height = target_profile["height"]
-                out_width = target_profile["width"]
-                out_crs = target_profile["crs"]
-                out_transform = target_profile["transform"]
-
-                destination = np.zeros((src.count, out_height, out_width), dtype=np.float32)
-
-                for band_idx in range(1, src.count + 1):
-                    reproject(
-                        source=rasterio.band(src, band_idx),
-                        destination=destination[band_idx - 1],
-                        src_transform=src.transform,
-                        src_crs=src.crs,
-                        dst_transform=out_transform,
-                        dst_crs=out_crs,
-                        resampling=Resampling.nearest,
-                    )
-
-                destination = normalize_reflectance_range(destination)
-                destination = reorder_gee_to_config_bands(destination)
-
-                return destination, tif_path
-
-    return None, None
-
-
-def find_chained_temporal_neighbor(
-    data_dir: Path,
-    output_dir: Path,
-    target_year: int,
-    target_month: int,
-    direction: str,
-    target_profile: dict,
-    max_search_months: int = 12,
-) -> Tuple[np.ndarray, float, int, int]:
-    """
-    Searches backward/forward up to max_search_months for valid 2D spatial texture.
-    """
-    step = -1 if direction == "prev" else 1
-
-    current_yr = target_year
-    current_m = target_month
-
-    for offset in range(1, max_search_months + 1):
-        current_m += step
-        if current_m < 1:
-            current_m = 12
-            current_yr -= 1
-        elif current_m > 12:
-            current_m = 1
-            current_yr += 1
-
-        gf_path = output_dir / f"landsat_{current_yr}_{current_m:02d}_rbfn_gapfilled.tif"
-        if gf_path.exists():
-            try:
-                with rasterio.open(gf_path) as src:
-                    cube = src.read()
-                    if cube.shape[0] >= 7 and np.any(np.isfinite(cube) & (cube > 0.0)):
-                        return cube[:7, :, :], float(offset), current_yr, current_m
-            except Exception:
-                pass
-
-        raw_cube, raw_path = find_and_load_target_scene(data_dir, current_yr, current_m, target_profile)
-        if raw_cube is not None:
-            valid_pixels = np.all(np.isfinite(raw_cube) & (raw_cube > 0.0), axis=0)
-            if np.mean(valid_pixels) >= 0.50:
-                return raw_cube, float(offset), current_yr, current_m
-
-    fallback_m = (target_month + step * max_search_months - 1) % 12 + 1
-    fallback_yr = target_year + (target_month + step * max_search_months - 1) // 12
-    return None, float(max_search_months), fallback_yr, fallback_m
-
-
-def load_climatological_month_composite(
-    data_dir: Path, output_dir: Path, month: int, target_profile: dict
-) -> np.ndarray:
-    """Computes a multi-year running average composite across historical scenes for target month."""
-    tif_files = (
-        list(data_dir.glob("*.tif"))
-        + list(data_dir.glob("*.tiff"))
-        + list(output_dir.glob("*.tif"))
-    )
-
-    out_h = target_profile["height"]
-    out_w = target_profile["width"]
-
-    running_sum = np.zeros((7, out_h, out_w), dtype=np.float32)
-    running_count = np.zeros((7, out_h, out_w), dtype=np.float32)
-    matched_files = 0
-
-    target_str_1 = f"_{month:02d}_"
-    target_str_2 = f"_{month}_"
-    target_str_3 = f"_{month:02d}."
-    target_str_4 = f"_{month}."
-
-    for tif_path in tif_files:
-        stem = tif_path.stem.lower()
-        if (
-            target_str_1 in stem
-            or target_str_2 in stem
-            or stem.endswith(target_str_3[:-1])
-            or stem.endswith(target_str_4[:-1])
-        ):
-            try:
-                with rasterio.open(tif_path) as src:
-                    dest = np.zeros((src.count, out_h, out_w), dtype=np.float32)
-                    for b in range(1, src.count + 1):
+    def read(self, path: Path) -> Optional[np.ndarray]:
+        """Reads one scene (uncached)."""
+        p = self.profile
+        h, w = int(p["height"]), int(p["width"])
+        try:
+            with rasterio.open(path) as src:
+                if src.count < N_BANDS:
+                    print(f"  ! {path.name}: only {src.count} bands, skipped.")
+                    return None
+                nodata = src.nodata
+                if self._same_grid(src):
+                    data = src.read(indexes=list(range(1, N_BANDS + 1)), out_dtype="float32")
+                    if nodata is not None and np.isfinite(nodata):
+                        data[data == nodata] = np.nan
+                else:
+                    data = np.zeros((N_BANDS, h, w), dtype=np.float32)
+                    for b in range(1, N_BANDS + 1):
                         reproject(
                             source=rasterio.band(src, b),
-                            destination=dest[b - 1],
+                            destination=data[b - 1],
                             src_transform=src.transform,
                             src_crs=src.crs,
-                            dst_transform=target_profile["transform"],
-                            dst_crs=target_profile["crs"],
+                            src_nodata=nodata,
+                            dst_transform=p["transform"],
+                            dst_crs=p["crs"],
+                            dst_nodata=0.0,
                             resampling=Resampling.nearest,
                         )
+        except Exception as exc:
+            print(f"  ! Could not read {path.name}: {exc}")
+            return None
 
-                    dest = normalize_reflectance_range(dest)
-                    if src.count >= 7:
-                        dest = reorder_gee_to_config_bands(dest)
+        data = reorder_gee_to_config_bands(data)
+        data = np.ascontiguousarray(data, dtype=np.float32)
+        data = self._harmonise_scale(data)
+        data[~(data > 0)] = np.nan  # NaN, zero and negative values are invalid
+        np.clip(data, self.lo[:, None, None], self.hi[:, None, None], out=data)
+        return data
 
-                    valid_mask = np.isfinite(dest) & (dest > 0.0)
-                    running_sum[valid_mask] += dest[valid_mask]
-                    running_count[valid_mask] += 1.0
-                    matched_files += 1
-            except Exception:
-                continue
-
-    valid_composite_mask = running_count > 0
-    if not np.any(valid_composite_mask):
-        return None
-
-    composite = np.full((7, out_h, out_w), np.nan, dtype=np.float32)
-    composite[valid_composite_mask] = (
-        running_sum[valid_composite_mask] / running_count[valid_composite_mask]
-    )
-
-    for b in range(composite.shape[0]):
-        band = composite[b]
-        invalid_mask = (~np.isfinite(band)) | (band <= 0.0)
-        if np.any(~invalid_mask) and np.any(invalid_mask):
-            y_valid, x_valid = np.where(~invalid_mask)
-            y_nan, x_nan = np.where(invalid_mask)
-            valid_vals = band[~invalid_mask]
-
-            band[invalid_mask] = griddata(
-                (y_valid, x_valid), valid_vals, (y_nan, x_nan), method="nearest"
-            )
-            composite[b] = band
-
-    return composite
+    def get(self, year: int, month: int) -> Optional[np.ndarray]:
+        key = (year, month)
+        if key in self._cache:
+            self._cache.move_to_end(key)
+            return self._cache[key]
+        path = self.index.get(key)
+        if path is None:
+            return None
+        cube = self.read(path)
+        self._cache[key] = cube
+        while len(self._cache) > self.cache_size:
+            self._cache.popitem(last=False)
+        return cube
 
 
-def build_master_spatial_template(
-    data_dir: Path, output_dir: Path, target_profile: dict
-) -> np.ndarray:
-    """Builds an archive-wide 2D landscape template to guarantee spatial texture."""
-    out_h = target_profile["height"]
-    out_w = target_profile["width"]
-
-    running_sum = np.zeros((7, out_h, out_w), dtype=np.float32)
-    running_count = np.zeros((7, out_h, out_w), dtype=np.float32)
-
-    tif_files = list(data_dir.glob("*.tif")) + list(output_dir.glob("*.tif"))
-
-    for tif_path in tif_files[:30]:
-        try:
-            with rasterio.open(tif_path) as src:
-                dest = np.zeros((src.count, out_h, out_w), dtype=np.float32)
-                for b in range(1, src.count + 1):
-                    reproject(
-                        source=rasterio.band(src, b),
-                        destination=dest[b - 1],
-                        src_transform=src.transform,
-                        src_crs=src.crs,
-                        dst_transform=target_profile["transform"],
-                        dst_crs=target_profile["crs"],
-                        resampling=Resampling.nearest,
-                    )
-                dest = normalize_reflectance_range(dest)
-                if src.count >= 7:
-                    dest = reorder_gee_to_config_bands(dest)
-
-                valid_mask = np.isfinite(dest) & (dest > 0.0)
-                running_sum[valid_mask] += dest[valid_mask]
-                running_count[valid_mask] += 1.0
-        except Exception:
-            continue
-
-    master = np.full((7, out_h, out_w), 0.15, dtype=np.float32)
-    valid_cells = running_count > 0
-    if np.any(valid_cells):
-        master[valid_cells] = running_sum[valid_cells] / running_count[valid_cells]
-
-    return master
-
-
-def flatten_raster_features(raster_cube: np.ndarray) -> np.ndarray:
-    raster_cube = np.asarray(raster_cube, dtype=np.float32)
-    bands, height, width = raster_cube.shape
-    return np.ascontiguousarray(
-        raster_cube.reshape(bands, height * width).T, dtype=np.float32
-    )
-
-
+# ------------------------------------------------------- model + scalers --
 def validate_scalers(
     x_mean: np.ndarray,
     x_std: np.ndarray,
     y_mean: np.ndarray,
     y_std: np.ndarray,
-) -> Tuple[np.ndarray, np.ndarray, np.ndarray, np.ndarray]:
-    x_mean = np.asarray(x_mean, dtype=np.float32).ravel()
-    x_std = np.asarray(x_std, dtype=np.float32).ravel()
-    y_mean = np.asarray(y_mean, dtype=np.float32).ravel()
-    y_std = np.asarray(y_std, dtype=np.float32).ravel()
+) -> tuple[np.ndarray, np.ndarray, np.ndarray, np.ndarray]:
+    x_mean = np.asarray(x_mean).ravel()
+    x_std = np.asarray(x_std).ravel()
+    y_mean = np.asarray(y_mean).ravel()
+    y_std = np.asarray(y_std).ravel()
+
+    expected_x_shape = (EXPECTED_IN_FEATURES,)
+    expected_y_shape = (EXPECTED_OUT_FEATURES,)
+
+    if x_mean.shape != expected_x_shape:
+        raise ValueError(f"x_mean must have shape {expected_x_shape}, got {x_mean.shape}.")
+    if x_std.shape != expected_x_shape:
+        raise ValueError(f"x_std must have shape {expected_x_shape}, got {x_std.shape}.")
+    if y_mean.shape != expected_y_shape:
+        raise ValueError(f"y_mean must have shape {expected_y_shape}, got {y_mean.shape}.")
+    if y_std.shape != expected_y_shape:
+        raise ValueError(f"y_std must have shape {expected_y_shape}, got {y_std.shape}.")
+
+    arrays = {"x_mean": x_mean, "x_std": x_std, "y_mean": y_mean, "y_std": y_std}
+    for name, array in arrays.items():
+        if not np.all(np.isfinite(array)):
+            raise ValueError(f"{name} contains non-finite values.")
+
+    if np.any(x_std <= 0):
+        raise ValueError("x_std contains zero or negative values.")
+    if np.any(y_std <= 0):
+        raise ValueError("y_std contains zero or negative values.")
 
     return x_mean, x_std, y_mean, y_std
 
 
-def load_model_and_scalers(config: Dict, root_dir: Path):
+def load_model_and_scalers(
+    config: Dict,
+    root_dir: Path,
+) -> Tuple[RBFN, np.ndarray, np.ndarray, np.ndarray, np.ndarray]:
     model_dir = root_dir / config["paths"]["processed_dir"] / "models"
     model_path = model_dir / "rbfn_landsat_gap_filler.pt"
     scaler_path = model_dir / "rbfn_scalers.joblib"
+
+    if not model_path.exists():
+        raise FileNotFoundError(f"Model checkpoint not found: {model_path}")
+    if not scaler_path.exists():
+        raise FileNotFoundError(f"Scaler checkpoint not found: {scaler_path}")
 
     rbfn_config = config["model"]["rbfn"]
 
@@ -347,7 +348,12 @@ def load_model_and_scalers(config: Dict, root_dir: Path):
     )
 
     checkpoint = torch.load(model_path, map_location="cpu", weights_only=True)
+
     state_dict = checkpoint.get("state_dict") or checkpoint.get("model_state_dict")
+    if state_dict is None:
+        raise KeyError(
+            "The model checkpoint does not contain 'state_dict' or 'model_state_dict'."
+        )
 
     if "centers" in state_dict:
         model.centers = state_dict["centers"].to(model.centers.device)
@@ -356,11 +362,37 @@ def load_model_and_scalers(config: Dict, root_dir: Path):
     model.eval()
 
     scalers = joblib.load(scaler_path)
+    if not isinstance(scalers, dict):
+        raise TypeError("The scaler checkpoint must contain a dictionary.")
+
+    required_keys = {"x_mean", "x_std", "y_mean", "y_std"}
+    missing_keys = required_keys.difference(scalers.keys())
+    if missing_keys:
+        raise KeyError(
+            f"Scaler checkpoint is missing required keys: {sorted(missing_keys)}."
+        )
+
+    x_mean = np.asarray(scalers["x_mean"], dtype=np.float32)
+    x_std = np.asarray(scalers["x_std"], dtype=np.float32)
+    y_mean = np.asarray(scalers["y_mean"], dtype=np.float32)
+    y_std = np.asarray(scalers["y_std"], dtype=np.float32)
 
     x_mean, x_std, y_mean, y_std = validate_scalers(
-        scalers["x_mean"], scalers["x_std"], scalers["y_mean"], scalers["y_std"]
+        x_mean=x_mean, x_std=x_std, y_mean=y_mean, y_std=y_std
     )
 
+    binary_feature_indices = scalers.get(
+        "binary_feature_indices", list(BINARY_FEATURE_INDICES)
+    )
+    if tuple(binary_feature_indices) != BINARY_FEATURE_INDICES:
+        raise ValueError(
+            f"Unexpected binary feature indices in scaler checkpoint: {binary_feature_indices}."
+        )
+
+    x_mean = x_mean.copy()
+    x_std = x_std.copy()
+
+    # Availability flags are binary: no shift, unit scale.
     x_mean[PREV_AVAILABLE_INDEX] = 0.0
     x_mean[NEXT_AVAILABLE_INDEX] = 0.0
     x_std[PREV_AVAILABLE_INDEX] = 1.0
@@ -369,25 +401,254 @@ def load_model_and_scalers(config: Dict, root_dir: Path):
     return model, x_mean, x_std, y_mean, y_std
 
 
-def predict_in_chunks(model: RBFN, X: np.ndarray, chunk_size: int) -> np.ndarray:
-    predictions = []
+# ------------------------------------------------------ predictor handling --
+def sanitize_predictor(array: np.ndarray, fallback: float, label: str) -> np.ndarray:
+    """
+    Returns a flat float32 predictor with no NaN / inf. Missing cells take the
+    median of the valid cells, or the training mean if nothing is valid. A NaN
+    predictor must never remove a pixel from the output.
+    """
+    a = np.asarray(array, dtype=np.float32)
+    finite = np.isfinite(a)
+    if finite.all():
+        return np.ascontiguousarray(a.ravel())
+    fill = float(np.median(a[finite])) if finite.any() else float(fallback)
+    pct = 100.0 * (1.0 - finite.mean())
+    print(f"  ! {label}: {pct:.1f}% non-finite cells replaced with {fill:.4f}")
+    return np.ascontiguousarray(np.where(finite, a, fill).astype(np.float32).ravel())
+
+
+# ------------------------------------------------- per-pixel temporal context --
+def collect_temporal_context(
+    store: SceneStore,
+    year: int,
+    month: int,
+    gap_idx: np.ndarray,
+    window: int,
+) -> Dict[str, np.ndarray]:
+    """
+    For every gap pixel, finds the nearest real previous and the nearest real
+    next observation within `window` months. Values, dt and availability are all
+    per pixel. Where nothing is found, bands stay zero, dt stays 0 and the flag
+    stays 0, exactly the convention used in training.
+    """
+    n = gap_idx.size
+    ctx = {
+        "prev_vals": np.zeros((n, N_BANDS), dtype=np.float32),
+        "next_vals": np.zeros((n, N_BANDS), dtype=np.float32),
+        "prev_dt": np.zeros(n, dtype=np.float32),
+        "next_dt": np.zeros(n, dtype=np.float32),
+        "prev_ok": np.zeros(n, dtype=bool),
+        "next_ok": np.zeros(n, dtype=bool),
+    }
+
+    for k in range(1, window + 1):
+        for direction, delta in (("prev", -k), ("next", k)):
+            ok = ctx[f"{direction}_ok"]
+            if ok.all():
+                continue
+            y, m = shift_month(year, month, delta)
+            scene = store.get(y, m)
+            if scene is None:
+                continue
+            todo = np.flatnonzero(~ok)
+            vals = scene.reshape(N_BANDS, -1)[:, gap_idx[todo]].T
+            good = np.all(np.isfinite(vals), axis=1)
+            sel = todo[good]
+            if sel.size:
+                ctx[f"{direction}_vals"][sel] = vals[good]
+                ctx[f"{direction}_dt"][sel] = k * DT_PER_MONTH
+                ok[sel] = True
+        if ctx["prev_ok"].all() and ctx["next_ok"].all():
+            break
+    return ctx
+
+
+def predict_gap_pixels(
+    model: RBFN,
+    x_mean: np.ndarray,
+    x_std: np.ndarray,
+    y_mean: np.ndarray,
+    y_std: np.ndarray,
+    gap_idx: np.ndarray,
+    sel: np.ndarray,
+    ctx: Dict[str, np.ndarray],
+    era5_precip: np.ndarray,
+    era5_temp: np.ndarray,
+    dem_flat: np.ndarray,
+    chunk_size: int,
+) -> np.ndarray:
+    """RBFN inference for gap_idx[sel], built and scaled chunk by chunk."""
+    if chunk_size <= 0:
+        raise ValueError("chunk_size must be greater than zero.")
+
+    n = sel.size
+    out = np.empty((n, EXPECTED_OUT_FEATURES), dtype=np.float32)
+
     with torch.no_grad():
-        for start in range(0, X.shape[0], chunk_size):
-            end = min(start + chunk_size, X.shape[0])
-            X_chunk = torch.from_numpy(np.ascontiguousarray(X[start:end], dtype=np.float32))
-            prediction = model(X_chunk)
-            predictions.append(prediction.cpu().numpy().astype(np.float32, copy=False))
-    return np.concatenate(predictions, axis=0)
+        for start in range(0, n, chunk_size):
+            end = min(start + chunk_size, n)
+            rows = sel[start:end]
+            px = gap_idx[rows]
+
+            X = np.zeros((end - start, EXPECTED_IN_FEATURES), dtype=np.float32)
+            X[:, PREVIOUS_BAND_START:PREVIOUS_BAND_END] = ctx["prev_vals"][rows]
+            X[:, NEXT_BAND_START:NEXT_BAND_END] = ctx["next_vals"][rows]
+            X[:, DT_PREV_INDEX] = ctx["prev_dt"][rows]
+            X[:, DT_NEXT_INDEX] = ctx["next_dt"][rows]
+            X[:, PREV_AVAILABLE_INDEX] = ctx["prev_ok"][rows]
+            X[:, NEXT_AVAILABLE_INDEX] = ctx["next_ok"][rows]
+            X[:, ERA5_PRECIP_INDEX] = era5_precip[px]
+            X[:, ERA5_TEMP_INDEX] = era5_temp[px]
+            X[:, DEM_INDEX] = dem_flat[px]
+
+            X_scaled = np.ascontiguousarray((X - x_mean) / x_std, dtype=np.float32)
+            pred_scaled = model(torch.from_numpy(X_scaled)).cpu().numpy()
+            out[start:end] = pred_scaled * y_std + y_mean
+
+    return out
 
 
-def reconstruct_raster(prediction_physical: np.ndarray, height: int, width: int) -> np.ndarray:
-    return np.ascontiguousarray(
-        prediction_physical.T.reshape(EXPECTED_OUT_FEATURES, height, width),
-        dtype=np.float32,
+# ----------------------------------------------------------- climatology --
+def _accumulate_composite(
+    store: SceneStore, scene_keys: list, h: int, w: int
+) -> np.ndarray:
+    """Per-pixel mean of the given real scenes (NaN where no scene is valid)."""
+    total = np.zeros((N_BANDS, h, w), dtype=np.float32)
+    count = np.zeros((h, w), dtype=np.float32)
+    for key in scene_keys:
+        cube = store.read(store.index[key])
+        if cube is None:
+            continue
+        ok = np.all(np.isfinite(cube), axis=0)
+        total[:, ok] += cube[:, ok]
+        count[ok] += 1.0
+        del cube, ok
+    composite = np.full((N_BANDS, h, w), np.nan, dtype=np.float32)
+    has = count > 0
+    composite[:, has] = total[:, has] / count[has]
+    del total, count
+    gc.collect()
+    return composite
+
+
+def build_climatology(
+    store: SceneStore, month: int, aoi_mask: np.ndarray
+) -> Optional[np.ndarray]:
+    """
+    Multi-year composite of one calendar month at full resolution. Exact-month
+    scenes are used first; adjacent months only fill pixels the exact month
+    never observed, so seasonality is not blurred where real data exists.
+    """
+    h, w = aoi_mask.shape
+    exact, adjacent = [], []
+    for (y, m) in store.index:
+        diff = min((m - month) % 12, (month - m) % 12)
+        if diff == 0:
+            exact.append((y, m))
+        elif diff == 1:
+            adjacent.append((y, m))
+
+    if not exact and not adjacent:
+        return None
+
+    composite = (
+        _accumulate_composite(store, exact, h, w)
+        if exact
+        else np.full((N_BANDS, h, w), np.nan, dtype=np.float32)
     )
+    missing = aoi_mask & ~np.isfinite(composite[0])
+    if adjacent and missing.any():
+        adj = _accumulate_composite(store, adjacent, h, w)
+        use = missing & np.isfinite(adj[0])
+        composite[:, use] = adj[:, use]
+        del adj
+        gc.collect()
+    return composite
 
 
+class ClimatologyProvider:
+    """Builds each calendar-month composite once, caches it on disk, and keeps
+    the most recent one in memory. Delete the cache folder to rebuild."""
+
+    def __init__(self, store: SceneStore, aoi_mask: np.ndarray, cache_dir: Path) -> None:
+        self.store = store
+        self.aoi_mask = aoi_mask
+        self.cache_dir = cache_dir
+        self._month: Optional[int] = None
+        self._data: Optional[np.ndarray] = None
+
+    def get(self, month: int) -> Optional[np.ndarray]:
+        if self._month == month:
+            return self._data
+
+        path = self.cache_dir / f"climatology_{month:02d}.tif"
+        data = None
+        if path.exists():
+            with rasterio.open(path) as src:
+                data = src.read().astype(np.float32)
+        else:
+            print(f"  Building climatology for calendar month {month:02d} (one-off)...")
+            data = build_climatology(self.store, month, self.aoi_mask)
+            if data is not None:
+                self.cache_dir.mkdir(parents=True, exist_ok=True)
+                profile = self.store.profile.copy()
+                profile.update(
+                    driver="GTiff",
+                    count=N_BANDS,
+                    dtype="float32",
+                    nodata=np.nan,
+                    compress="deflate",
+                    BIGTIFF="IF_SAFER",
+                )
+                with rasterio.open(path, "w", **profile) as dst:
+                    dst.write(data)
+
+        self._month, self._data = month, data
+        return data
+
+
+# --------------------------------------------------------- spatial residual --
+def spatial_fill_residual(
+    cube: np.ndarray, source: np.ndarray, aoi_mask: np.ndarray
+) -> int:
+    """
+    Fills AOI pixels still missing after every other stage from the nearest valid
+    pixel, then smooths only those filled pixels. Works in place on cube (7,H,W)
+    and source (H,W). Returns the number of pixels filled.
+    """
+    known = aoi_mask & np.all(np.isfinite(cube), axis=0)
+    unknown = aoi_mask & ~known
+    if not unknown.any() or not known.any():
+        return 0
+
+    iy, ix = distance_transform_edt(~known, return_distances=False, return_indices=True)
+    uy, ux = iy[unknown], ix[unknown]
+    weight = gaussian_filter(known.astype(np.float32), SPATIAL_SMOOTH_SIGMA)
+
+    for b in range(cube.shape[0]):
+        band = cube[b]
+        nearest = band[uy, ux]
+        smooth = gaussian_filter(np.where(known, band, 0.0).astype(np.float32), SPATIAL_SMOOTH_SIGMA)
+        w = weight[unknown]
+        smoothed = np.where(w > 0.02, smooth[unknown] / np.maximum(w, 1e-6), nearest)
+        band[unknown] = smoothed.astype(np.float32)
+        cube[b] = band
+
+    source[unknown] = SRC_SPATIAL
+    return int(unknown.sum())
+
+
+# ------------------------------------------------------------------ output --
 def derive_ndvi(reconstructed_cube: np.ndarray) -> np.ndarray:
+    if reconstructed_cube.ndim != 3:
+        raise ValueError("Reconstructed Landsat cube must have shape (bands, height, width).")
+    if reconstructed_cube.shape[0] != EXPECTED_OUT_FEATURES:
+        raise ValueError(
+            f"Expected {EXPECTED_OUT_FEATURES} reconstructed bands, "
+            f"got {reconstructed_cube.shape[0]}."
+        )
+
     red = reconstructed_cube[RED_INDEX]
     nir = reconstructed_cube[NIR_INDEX]
     denominator = nir + red
@@ -400,210 +661,298 @@ def derive_ndvi(reconstructed_cube: np.ndarray) -> np.ndarray:
         & (np.abs(denominator) > 1e-8)
     )
     ndvi[valid] = ((nir[valid] - red[valid]) / denominator[valid]).astype(np.float32)
-    return ndvi
+    return np.clip(ndvi, -1.0, 1.0)
 
 
-def run_flat_block_qa_check(
-    reconstructed_cube: np.ndarray, aoi_mask: np.ndarray, year: int, month: int
-) -> bool:
-    """Performs spatial variance and unique value diagnostics on output raster."""
-    red_band = reconstructed_cube[RED_INDEX][aoi_mask]
-    valid_red = red_band[np.isfinite(red_band) & (red_band > 0.0)]
+def write_raster(
+    path: Path,
+    array: np.ndarray,
+    profile: Dict,
+    nodata: float,
+    dtype: str = "float32",
+) -> None:
+    path.parent.mkdir(parents=True, exist_ok=True)
+    output_profile = profile.copy()
 
-    if len(valid_red) == 0:
-        print(f"⚠️ [QA ALERT] [{year}-{month:02d}] Zero valid pixels inside AOI boundary!")
-        return False
+    if array.ndim == 2:
+        height, width = array.shape
+        count = 1
+    elif array.ndim == 3:
+        count, height, width = array.shape
+    else:
+        raise ValueError(f"Raster array must be 2D or 3D, got {array.shape}.")
 
-    std_dev = np.std(valid_red)
-    unique_count = len(np.unique(np.round(valid_red, decimals=5)))
+    if height != output_profile["height"] or width != output_profile["width"]:
+        raise ValueError("Raster dimensions do not match the target profile.")
 
-    if std_dev < 1e-4 or unique_count <= 10:
-        print(
-            f"⚠️ [QA ALERT] [{year}-{month:02d}] FLAT BLOCK DETECTED! "
-            f"StdDev: {std_dev:.6f} | Unique Values: {unique_count:,}"
-        )
-        return False
-
-    print(
-        f"✅ [QA PASS] [{year}-{month:02d}] Spatial Texture Verified. "
-        f"StdDev: {std_dev:.4f} | Unique Values: {unique_count:,}"
+    output_profile.update(
+        {
+            "driver": "GTiff",
+            "height": height,
+            "width": width,
+            "count": count,
+            "dtype": dtype,
+            "nodata": nodata,
+            "compress": "deflate",
+            "BIGTIFF": "IF_SAFER",
+        }
     )
-    return True
+
+    with rasterio.open(path, "w", **output_profile) as dst:
+        if dtype == "float32":
+            output = np.where(np.isfinite(array), array, nodata).astype(np.float32, copy=False)
+        else:
+            output = array.astype(dtype, copy=False)
+        if output.ndim == 2:
+            dst.write(output, 1)
+        else:
+            dst.write(output)
 
 
-def process_gap_month(
-    processor: RasterProcessor,
+# ------------------------------------------------------------- one month --
+def process_month(
+    store: SceneStore,
+    climatology: ClimatologyProvider,
     model: RBFN,
     x_mean: np.ndarray,
     x_std: np.ndarray,
     y_mean: np.ndarray,
     y_std: np.ndarray,
-    dem: np.ndarray,
-    master_template: np.ndarray,
+    processor: RasterProcessor,
+    dem_flat: np.ndarray,
+    aoi_mask: np.ndarray,
     target_profile: Dict,
     output_dir: Path,
     year: int,
     month: int,
     chunk_size: int,
     output_nodata: float,
+    window: int,
     threshold_pct: float = 80.0,
-) -> bool:
-    aoi_mask = get_aoi_mask(target_profile)
-    aoi_mask_flat = aoi_mask.ravel()
-    height, width = target_profile["height"], target_profile["width"]
-    H, W = height, width
+) -> Dict:
+    tag = f"[{year}-{month:02d}]"
+    height, width = aoi_mask.shape
+    aoi_flat = aoi_mask.ravel()
+    n_aoi = int(aoi_flat.sum())
 
-    landsat_dir = Path(__file__).resolve().parents[1] / "data" / "landsat"
-    target_cube, scene_path = find_and_load_target_scene(
-        landsat_dir, year, month, target_profile
+    # 1. REAL OBSERVATIONS of the target month
+    target = store.get(year, month)
+    obs_flat = np.zeros(aoi_flat.shape, dtype=bool)
+    if target is not None:
+        obs_flat = aoi_flat & np.all(np.isfinite(target.reshape(N_BANDS, -1)), axis=0)
+    coverage_pct = 100.0 * obs_flat.sum() / max(n_aoi, 1)
+    print(f"{tag} real coverage {coverage_pct:.2f}% ({'scene found' if target is not None else 'no scene'})")
+
+    if coverage_pct >= threshold_pct and not PROCESS_SUFFICIENT_MONTHS:
+        print(f"{tag} coverage >= {threshold_pct}%, skipped by configuration.")
+        return {"status": "SKIPPED"}
+
+    out = np.full((N_BANDS, height * width), np.nan, dtype=np.float32)
+    source = np.zeros(height * width, dtype=np.uint8)
+
+    if target is not None and obs_flat.any():
+        out[:, obs_flat] = target.reshape(N_BANDS, -1)[:, obs_flat]
+        source[obs_flat] = SRC_OBSERVED
+
+    gap_idx = np.flatnonzero(aoi_flat & ~obs_flat)
+
+    # 2. RBFN where a real previous and/or next observation exists per pixel
+    n_rbfn = 0
+    if gap_idx.size:
+        ctx = collect_temporal_context(store, year, month, gap_idx, window)
+        has_ctx = ctx["prev_ok"] | ctx["next_ok"]
+        sel = np.flatnonzero(has_ctx)
+        if sel.size:
+            era5_precip = sanitize_predictor(
+                processor.load_era5_predictor("precip", year, month),
+                x_mean[ERA5_PRECIP_INDEX], "ERA5 precip",
+            )
+            era5_temp = sanitize_predictor(
+                processor.load_era5_predictor("temp", year, month),
+                x_mean[ERA5_TEMP_INDEX], "ERA5 temp",
+            )
+            pred = predict_gap_pixels(
+                model, x_mean, x_std, y_mean, y_std,
+                gap_idx, sel, ctx, era5_precip, era5_temp, dem_flat, chunk_size,
+            )
+            finite = np.all(np.isfinite(pred), axis=1)
+            px = gap_idx[sel[finite]]
+            out[:, px] = pred[finite].T
+            source[px] = SRC_RBFN
+            n_rbfn = int(finite.sum())
+            del era5_precip, era5_temp, pred, finite, px
+        del ctx, has_ctx, sel
+
+    # 3. CLIMATOLOGY for pixels with no real observation inside the window
+    remaining = gap_idx[source[gap_idx] == SRC_NONE] if gap_idx.size else gap_idx
+    n_clim = 0
+    if remaining.size:
+        clim = climatology.get(month)
+        if clim is not None:
+            vals = clim.reshape(N_BANDS, -1)[:, remaining].T
+            ok = np.all(np.isfinite(vals), axis=1)
+            out[:, remaining[ok]] = vals[ok].T
+            source[remaining[ok]] = SRC_CLIMATOLOGY
+            n_clim = int(ok.sum())
+            del vals, ok
+
+    # 4. Range check, then SPATIAL fill of whatever is still empty
+    cube = out.reshape(N_BANDS, height, width)
+    lo, hi = store.lo, store.hi
+    np.clip(cube, lo[:, None, None], hi[:, None, None], out=cube)
+    cube[:, ~aoi_mask] = np.nan
+
+    source2d = source.reshape(height, width)
+    n_spatial = spatial_fill_residual(cube, source2d, aoi_mask)
+    np.clip(cube, lo[:, None, None], hi[:, None, None], out=cube)
+    cube[:, ~aoi_mask] = np.nan
+
+    # 5. Write
+    ndvi = derive_ndvi(cube)
+
+    band_path = output_dir / f"landsat_{year}_{month:02d}_rbfn_gapfilled.tif"
+    ndvi_path = output_dir / f"ndvi_{year}_{month:02d}_rbfn_gapfilled.tif"
+    prov_path = output_dir / "provenance" / f"landsat_{year}_{month:02d}_source.tif"
+
+    write_raster(band_path, cube, target_profile, output_nodata)
+    write_raster(ndvi_path, ndvi, target_profile, output_nodata)
+    write_raster(prov_path, source2d, target_profile, 0, dtype="uint8")
+
+    final_valid = aoi_mask & np.all(np.isfinite(cube), axis=0)
+    final_pct = 100.0 * final_valid.sum() / max(n_aoi, 1)
+    n_obs = int((source == SRC_OBSERVED).sum())
+
+    print(
+        f"{tag} observed {n_obs:,} | RBFN {n_rbfn:,} | climatology {n_clim:,} | "
+        f"spatial {n_spatial:,} | final coverage {final_pct:.2f}%"
     )
+    red_mean = float(np.nanmean(cube[RED_INDEX][final_valid])) if final_valid.any() else float("nan")
+    blue_mean = float(np.nanmean(cube[2][final_valid])) if final_valid.any() else float("nan")
+    print(f"{tag} sanity -> Red {red_mean:.4f} | Blue {blue_mean:.4f}")
 
-    target_flat = None
-    real_obs_mask = np.zeros(aoi_mask_flat.shape, dtype=bool)
+    def pct(v: int) -> float:
+        return round(100.0 * v / max(n_aoi, 1), 3)
 
-    if target_cube is not None:
-        target_flat = flatten_raster_features(target_cube)
-        real_obs_mask = aoi_mask_flat & np.all(
-            np.isfinite(target_flat) & (target_flat > 0.0), axis=1
-        )
+    del out, cube, ndvi, source, source2d, target
+    gc.collect()
 
-    total_aoi_pixels = np.sum(aoi_mask_flat)
-    valid_aoi_pixels = np.sum(real_obs_mask)
-    coverage_pct = (valid_aoi_pixels / max(total_aoi_pixels, 1)) * 100.0
-
-    if coverage_pct >= threshold_pct:
-        print(f"[{year}-{month:02d}] Clean Scene ({coverage_pct:.2f}% >= {threshold_pct}%). Skipping.")
-        return False
-
-    prev_cube, dt_prev, prev_yr, prev_m = find_chained_temporal_neighbor(
-        landsat_dir, output_dir, year, month, "prev", target_profile, max_search_months=12
-    )
-    next_cube, dt_next, next_yr, next_m = find_chained_temporal_neighbor(
-        landsat_dir, output_dir, year, month, "next", target_profile, max_search_months=12
-    )
-
-    if prev_cube is None:
-        prev_cube = load_climatological_month_composite(landsat_dir, output_dir, prev_m, target_profile)
-
-    if next_cube is None:
-        next_cube = load_climatological_month_composite(landsat_dir, output_dir, next_m, target_profile)
-
-    # NO STATIC SCALAR FALLBACK: Use 2D Master Catchment Spatial Pattern if composite is missing
-    if prev_cube is None:
-        prev_cube = master_template
-    if next_cube is None:
-        next_cube = master_template
-
-    prev_clean = fill_slc_off_scanlines(prev_cube)
-    next_clean = fill_slc_off_scanlines(next_cube)
-
-    X = np.zeros((H * W, 21), dtype=np.float32)
-    X[:, 0:7] = prev_clean.reshape(7, -1).T
-    X[:, 7:14] = next_clean.reshape(7, -1).T
-    X[:, 14] = dt_prev
-    X[:, 15] = dt_next
-    X[:, 16] = 1.0
-    X[:, 17] = 1.0
-    X[:, 18] = processor.load_era5_predictor("precip", year, month).ravel()
-    X[:, 19] = processor.load_era5_predictor("temp", year, month).ravel()
-    X[:, 20] = dem.ravel()
-
-    gap_pixels_mask = aoi_mask_flat & (~real_obs_mask)
-
-    prediction_physical = np.full(
-        (X.shape[0], EXPECTED_OUT_FEATURES), np.nan, dtype=np.float32
-    )
-
-    if valid_aoi_pixels > 0 and target_flat is not None:
-        prediction_physical[real_obs_mask] = target_flat[real_obs_mask]
-
-    if np.any(gap_pixels_mask):
-        X_valid = X[gap_pixels_mask]
-        X_scaled = (X_valid - x_mean) / x_std
-        prediction_scaled = predict_in_chunks(model=model, X=X_scaled, chunk_size=chunk_size)
-        prediction_physical[gap_pixels_mask] = (prediction_scaled * y_std) + y_mean
-
-    prediction_physical[~aoi_mask_flat] = np.nan
-
-    reconstructed_cube = reconstruct_raster(prediction_physical, height, width)
-    ndvi = derive_ndvi(reconstructed_cube)
-
-    run_flat_block_qa_check(reconstructed_cube, aoi_mask, year, month)
-
-    band_output_path = output_dir / f"landsat_{year}_{month:02d}_rbfn_gapfilled.tif"
-    ndvi_output_path = output_dir / f"ndvi_{year}_{month:02d}_rbfn_gapfilled.tif"
-
-    write_raster(band_output_path, reconstructed_cube, target_profile, output_nodata)
-    write_raster(ndvi_output_path, ndvi, target_profile, output_nodata)
-
-    print(f"[{year}-{month:02d}] Output Saved -> {band_output_path.name}")
-    return True
+    return {
+        "status": "COMPLETE" if final_pct >= 99.9 else "PARTIAL",
+        "year": year,
+        "month": month,
+        "total_aoi_pixels": n_aoi,
+        "observed_pct": pct(n_obs),
+        "rbfn_pct": pct(n_rbfn),
+        "climatology_pct": pct(n_clim),
+        "spatial_pct": pct(n_spatial),
+        "final_coverage_pct": round(final_pct, 3),
+    }
 
 
-def write_raster(path: Path, array: np.ndarray, profile: Dict, nodata: float) -> None:
-    path.parent.mkdir(parents=True, exist_ok=True)
-    out_profile = profile.copy()
-    count = 1 if array.ndim == 2 else array.shape[0]
-
-    out_profile.update({
-        "driver": "GTiff",
-        "height": array.shape[1] if array.ndim == 3 else array.shape[0],
-        "width": array.shape[2] if array.ndim == 3 else array.shape[1],
-        "count": count,
-        "dtype": "float32",
-        "nodata": nodata,
-    })
-
-    with rasterio.open(path, "w", **out_profile) as dst:
-        output = np.where(np.isfinite(array), array, nodata).astype(np.float32)
-        if array.ndim == 2:
-            dst.write(output, 1)
-        else:
-            dst.write(output)
-
-
+# ------------------------------------------------------------------- main --
 def main() -> None:
     root_dir = Path(__file__).resolve().parents[1]
-    config = load_config(root_dir / "src" / "config.yaml")
+    config_path = root_dir / "src" / "config.yaml"
+    config = load_config(config_path)
 
     seed = int(config["project"]["seed"])
     np.random.seed(seed)
     torch.manual_seed(seed)
 
-    model, x_mean, x_std, y_mean, y_std = load_model_and_scalers(config, root_dir)
+    model, x_mean, x_std, y_mean, y_std = load_model_and_scalers(
+        config=config, root_dir=root_dir
+    )
+
     processor = RasterProcessor(config)
     dem = processor.load_dem()
     target_profile = processor.get_target_profile()
+    dem_flat = sanitize_predictor(dem, x_mean[DEM_INDEX], "DEM")
+
+    aoi_mask = get_aoi_mask(target_profile)
 
     gap_start, gap_end = config["landsat"]["gap_years"]
     chunk_size = int(config["model"]["rbfn"]["chunk_size"])
     output_nodata = float(config["gap_filling"]["output_nodata"])
+    window = int(config["gap_filling"].get("search_window_months", SEARCH_WINDOW_MONTHS))
     output_dir = root_dir / config["paths"]["gapfilled_dir"]
-    landsat_dir = root_dir / "data" / "landsat"
+    output_dir.mkdir(parents=True, exist_ok=True)
 
-    print("Building 2D Master Catchment Spatial Pattern...")
-    master_template = build_master_spatial_template(landsat_dir, output_dir, target_profile)
+    landsat_dir = root_dir / "data" / "landsat"
+    index = index_scenes(landsat_dir)
+    if not index:
+        raise FileNotFoundError(f"No Landsat GeoTIFFs found in {landsat_dir}.")
+    print(f"Indexed {len(index)} real Landsat scenes. Search window: +/-{window} months.")
+
+    store = SceneStore(index, target_profile, y_mean, y_std)
+    climatology = ClimatologyProvider(
+        store=store,
+        aoi_mask=aoi_mask,
+        cache_dir=root_dir / config["paths"]["processed_dir"] / "climatology",
+    )
+
+    rows = []
+    total_complete = 0
+    total_partial = 0
+    total_failed = 0
+    total_skipped = 0
 
     for year in range(int(gap_start), int(gap_end) + 1):
         for month in range(1, 13):
-            process_gap_month(
-                processor=processor,
-                model=model,
-                x_mean=x_mean,
-                x_std=x_std,
-                y_mean=y_mean,
-                y_std=y_std,
-                dem=dem,
-                master_template=master_template,
-                target_profile=target_profile,
-                output_dir=output_dir,
-                year=year,
-                month=month,
-                chunk_size=chunk_size,
-                output_nodata=output_nodata,
-                threshold_pct=80.0,
-            )
+            print(f"Processing gap month: {year}-{month:02d}")
+            try:
+                result = process_month(
+                    store=store,
+                    climatology=climatology,
+                    model=model,
+                    x_mean=x_mean,
+                    x_std=x_std,
+                    y_mean=y_mean,
+                    y_std=y_std,
+                    processor=processor,
+                    dem_flat=dem_flat,
+                    aoi_mask=aoi_mask,
+                    target_profile=target_profile,
+                    output_dir=output_dir,
+                    year=year,
+                    month=month,
+                    chunk_size=chunk_size,
+                    output_nodata=output_nodata,
+                    window=window,
+                )
+            except Exception as exc:
+                traceback.print_exc()
+                result = {"status": f"FAILED: {exc}", "year": year, "month": month}
+
+            status = result["status"]
+            if status == "COMPLETE":
+                total_complete += 1
+            elif status == "PARTIAL":
+                total_partial += 1
+            elif status == "SKIPPED":
+                total_skipped += 1
+            else:
+                total_failed += 1
+
+            if status != "SKIPPED":
+                rows.append(result)
             gc.collect()
+
+    summary_path = output_dir / "gapfill_run_summary.csv"
+    fields = [
+        "year", "month", "total_aoi_pixels", "observed_pct", "rbfn_pct",
+        "climatology_pct", "spatial_pct", "final_coverage_pct", "status",
+    ]
+    with summary_path.open("w", newline="", encoding="utf-8") as fh:
+        writer = csv.DictWriter(fh, fieldnames=fields, extrasaction="ignore")
+        writer.writeheader()
+        writer.writerows(rows)
+
+    print("Gap-filling inference completed.")
+    print(f"Months complete (>= 99.9% of AOI): {total_complete}")
+    print(f"Months partial: {total_partial}")
+    print(f"Months failed: {total_failed}")
+    print(f"Months skipped: {total_skipped}")
+    print(f"Run summary: {summary_path}")
 
 
 if __name__ == "__main__":
