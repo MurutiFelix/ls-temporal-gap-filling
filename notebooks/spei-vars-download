@@ -1,0 +1,42 @@
+// gee/era5land_export.js
+
+/*
+Exports monthly ERA5-Land potential evaporation and precipitation (metres, monthly
+totals) at native 0.1 degree resolution for the SPEI calculation in variables.py.
+One single-band GeoTIFF per variable and month, named era5land_pet_YYYY_MM and
+era5land_precip_YYYY_MM. The export rectangle is the bounding box of the imported
+aoi table plus a 15 km buffer, so cells along the AOI edge keep their values.
+*/
+
+var START_YEAR = 1995;  // 1981 gives a longer SPEI calibration record
+var END_YEAR = 2025;
+
+var region = aoi.geometry().buffer(15000).bounds();  // aoi = imported table
+
+// check that this is the right area before running any task
+print('AOI area (km2):', aoi.geometry().area().divide(1e6));
+Map.centerObject(aoi, 8);
+Map.addLayer(region, {color: 'red'}, 'export rectangle');
+Map.addLayer(aoi, {color: 'blue'}, 'AOI');
+
+var era = ee.ImageCollection('ECMWF/ERA5_LAND/MONTHLY_AGGR');
+var bands = {pet: 'potential_evaporation_sum', precip: 'total_precipitation_sum'};
+
+for (var year = START_YEAR; year <= END_YEAR; year++) {
+  for (var month = 1; month <= 12; month++) {
+    var start = ee.Date.fromYMD(year, month, 1);
+    var img = era.filterDate(start, start.advance(1, 'month')).first();
+    var mm = ('0' + month).slice(-2);
+    for (var key in bands) {
+      Export.image.toDrive({
+        image: img.select(bands[key]).toFloat(),
+        description: 'era5land_' + key + '_' + year + '_' + mm,
+        folder: 'era5land',
+        region: region,
+        crs: 'EPSG:4326',
+        scale: 11132,  // native pixel size, no resampling
+        maxPixels: 1e9
+      });
+    }
+  }
+}
