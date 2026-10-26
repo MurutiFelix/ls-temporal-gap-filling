@@ -1,57 +1,74 @@
 # src/predict.py
 
 """
-RBFN inference engine for historical Landsat temporal gap filling (v2).
+RBFN inference engine for historical Landsat temporal gap filling (v4).
 
 Goal: every month in the gap period leaves as a complete, seamless 7-band
-Landsat cube (plus NDVI) with no empty months, no partial months and no
-constant-value blocks.
+Landsat image (plus NDVI) with real image texture and no constant-value blocks.
 
-Fill hierarchy (each AOI pixel is filled by the first stage that can serve it):
+Fill hierarchy (processing is strictly chronological):
 
-  1. OBSERVED     real Landsat pixels of the target month are kept untouched.
-  2. RBFN         gap pixels that have a real previous and/or next Landsat
-                  observation within the search window. Temporal context is
-                  searched PER PIXEL (nearest valid previous / next scene), so
-                  SLC-off stripes, clouds and partial tiles are all handled by
-                  the same rule, and dt_prev / dt_next are per-pixel values
-                  that are zero exactly when the matching availability flag is 0
-                  (the same convention the model was trained with).
-  3. CLIMATOLOGY  pixels with no real observation inside the window (typical
-                  for 1996-1999, where most of the catchment has no Landsat
-                  archive). Uses the per-pixel, 30 m multi-year composite of the
-                  same calendar month built from real scenes, so it keeps real
-                  spatial texture instead of a constant value.
-  4. SPATIAL      any residual pixel that was never observed in any year is
-                  filled from the nearest valid pixel and lightly smoothed.
+  1. OBSERVED   real Landsat pixels of the target month are kept untouched.
+  2. RBFN       every gap pixel is predicted by the RBFN. Its neighbours are,
+                per pixel and in this order of preference:
+                  a. the nearest REAL previous / next observation inside the
+                     search window,
+                  b. otherwise the PREVIOUS MONTH'S GAP-FILLED image (the
+                     chain), with dt set to the pixel's age (months since its
+                     last real observation, capped at the window).
+                Because the chain is always available after the first month,
+                the "both neighbours missing" case no longer occurs.
+  3. GUARD      An RBF network returns (almost) its bias when an input is far
+                from every training centre, which is the same value for the
+                whole area: a flat block. Each RBFN prediction is therefore
+                compared with a REFERENCE image that carries real texture:
+                  reference = multi-year climatology of the same calendar
+                              month (real 30 m pixels from other years),
+                              else the previous filled month, else the nearest
+                              real neighbour.
+                  * Predictions may differ from the reference by at most
+                    MAX_ANOMALY_SIGMAS training standard deviations.
+                  * Where the prediction has lost its texture (local std far
+                    below the reference's, or constant), it is discarded and
+                    replaced by  reference + smooth regional offset. The offset
+                    is learned from this month's real pixels (observed minus
+                    climatology) and from the healthy RBFN pixels, so the
+                    image keeps real texture and matches the month's state.
+             The guard also catches OUT-OF-DISTRIBUTION pixels exactly: the model
+             is  readout(exp(-gamma * d^2))  over the K-means centres, so a pixel
+             far from every centre outputs only the ridge intercept (one value
+             for the whole area). Such pixels are detected from the centre
+             distances and never written.
+             dt units (months or days) and the longest dt seen in training are
+             read from the training scaler, so inputs stay inside the range the
+             model was fitted on.
+  4. SPATIAL    only pixels never observed in any year and with no reference
+                are filled from the nearest valid pixel and smoothed.
 
-Why the old script produced empty / partial / blocky months
------------------------------------------------------------
-  * A scene-level 80 % coverage gate disabled RBFN for every neighbour that was
-    only partly valid. In 1995-1999 no neighbour reaches 80 %, so RBFN never ran.
-  * Fallback pixels were then taken from y_mean (one constant per band, i.e. a
-    uniform block) because the climatology file search pattern ("_MM_") did not
-    match stems that end in the month, so the composite was always None.
-  * Months with >= 80 % coverage were skipped completely, leaving residual gaps.
-  * Pixels with neither neighbour were still sent to RBFN with ERA5 + DEM only,
-    and ERA5 is a coarse grid, which gives rectangular blocks.
-  * dt_prev / dt_next were non-zero for pixels whose availability flag was 0.
-  * Any NaN in ERA5 / DEM removed the pixel from valid_mask, which is why some
-    months were written completely empty.
-  * Reflectance scaling was applied in the climatology path only, and outputs
-    were never range-checked (hence the repeated 1.6022 maximum).
+Usage
+-----
+  python src/predict.py                    all gap months in config
+  python src/predict.py 1996-01 1997-06    only this range (inclusive), still
+                                           chronological, so the chain works.
+                                           Use it to check a heavy-gap stretch
+                                           before running everything.
 
-Extra outputs per month
------------------------
-  landsat_YYYY_MM_rbfn_gapfilled.tif        7 bands, config order
-  ndvi_YYYY_MM_rbfn_gapfilled.tif           NDVI
-  provenance/landsat_YYYY_MM_source.tif     uint8: 1 observed, 2 RBFN,
-                                            3 climatology, 4 spatial
-  gapfill_run_summary.csv                   coverage and source shares per month
+Outputs per month
+-----------------
+  landsat_YYYY_MM_rbfn_gapfilled.tif      7 bands, config order
+  ndvi_YYYY_MM_rbfn_gapfilled.tif         NDVI
+  provenance/landsat_YYYY_MM_source.tif   uint8: 1 observed, 2 RBFN,
+                                          3 RBFN guarded (flat or out-of-distribution),
+                                          4 climatology, 5 previous filled
+                                          month / nearest neighbour, 6 spatial
+  preview/landsat_YYYY_MM.png             quick-look RGB (needs Pillow)
+  gapfill_run_summary.csv                 coverage, source shares and a
+                                          flat-block QA figure per month
 """
 import csv
 import gc
 import re
+import sys
 import traceback
 from collections import OrderedDict
 from pathlib import Path
@@ -65,7 +82,7 @@ import torch
 import yaml
 from rasterio.features import rasterize
 from rasterio.warp import Resampling, reproject
-from scipy.ndimage import distance_transform_edt, gaussian_filter
+from scipy.ndimage import distance_transform_edt, gaussian_filter, uniform_filter, zoom
 
 from models.rbfn import RBFN
 from preprocessing.raster_processor import RasterProcessor
@@ -92,28 +109,58 @@ BINARY_FEATURE_INDICES = (
 )
 
 # ---------------------------------------------------------------- tunables --
-# Months searched either side of the target for a real observation. Can be
+# Months searched either side of the target for a REAL observation. Can be
 # overridden with config["gap_filling"]["search_window_months"].
 SEARCH_WINDOW_MONTHS = 12
-# dt is expressed in months (the old script defaulted dt to 12.0). If the model
-# was trained with dt in days, set this to 30.4.
-DT_PER_MONTH = 1.0
+# Units of the dt features. None = infer from the training scaler (a mean dt
+# above 20 means days). Set 1.0 (months) or 30.4 (days) to force.
+DT_PER_MONTH_OVERRIDE = None
+# Longest dt (months) fed to the model. None = infer from the training scaler
+# (mean + 2 std of the training dt), never above the search window.
+MAX_DT_MONTHS_OVERRIDE = None
+# A pixel is out-of-distribution when it is further than OOD_FACTOR x (95th
+# percentile nearest-neighbour spacing of the RBF centres) from every centre.
+OOD_FACTOR = 2.0
 # True: also fill the residual gaps of months that already have >= 80 % real
 # coverage, so every month of the series is complete.
 PROCESS_SUFFICIENT_MONTHS = True
+# True: the previous month's gap-filled image is used as a neighbour wherever no
+# real previous observation exists inside the window.
+USE_FILLED_AS_NEIGHBOUR = True
 # Number of full scenes kept in memory (each is 7 x H x W float32).
-SCENE_CACHE_SIZE = 4
+SCENE_CACHE_SIZE = 3
 # Output values are clipped to y_mean +/- CLIP_SIGMAS * y_std (lower bound >= 0).
 CLIP_SIGMAS = 8.0
 # Smoothing (pixels) applied only to spatially filled residual pixels.
 SPATIAL_SMOOTH_SIGMA = 3.0
 
+# --- texture guard ---------------------------------------------------------
+# Maximum departure of an RBFN prediction from the reference image, in training
+# standard deviations of the target bands.
+MAX_ANOMALY_SIGMAS = 1.5
+# Window (pixels) for the local-texture test and bands it is applied to.
+TEXTURE_WINDOW = 31
+TEXTURE_BANDS = (RED_INDEX, NIR_INDEX)
+# A prediction is "flat" if its local std is below this share of the reference's
+# local std, or below FLAT_ABS_SIGMAS training std (i.e. constant).
+FLAT_RATIO = 0.35
+FLAT_ABS_SIGMAS = 0.01
+# Smoothing scale (pixels) of the regional offset applied in flat areas, and the
+# block factor used to compute it cheaply.
+OFFSET_SIGMA_PX = 60.0
+OFFSET_DOWNSAMPLE = 8
+# Quick-look PNGs.
+WRITE_PREVIEWS = True
+PREVIEW_STEP = 8
+
 # Provenance codes
 SRC_NONE = 0
 SRC_OBSERVED = 1
 SRC_RBFN = 2
-SRC_CLIMATOLOGY = 3
-SRC_SPATIAL = 4
+SRC_GUARDED = 3
+SRC_CLIMATOLOGY = 4
+SRC_CHAIN = 5
+SRC_SPATIAL = 6
 
 _SCENE_RE = re.compile(r"_(\d{4})_(\d{1,2})(?!\d)")
 
@@ -340,14 +387,21 @@ def load_model_and_scalers(
 
     rbfn_config = config["model"]["rbfn"]
 
+    checkpoint = torch.load(model_path, map_location="cpu", weights_only=True)
+
+    num_centers = int(checkpoint.get("num_centers", rbfn_config["num_centers"]))
+    if num_centers != int(rbfn_config["num_centers"]):
+        print(
+            f"Note: checkpoint has {num_centers} RBF centres, config says "
+            f"{rbfn_config['num_centers']}. Using the checkpoint value."
+        )
+
     model = RBFN(
         in_features=EXPECTED_IN_FEATURES,
-        num_centers=int(rbfn_config["num_centers"]),
+        num_centers=num_centers,
         out_features=EXPECTED_OUT_FEATURES,
         rbf_chunk_size=int(rbfn_config["chunk_size"]),
     )
-
-    checkpoint = torch.load(model_path, map_location="cpu", weights_only=True)
 
     state_dict = checkpoint.get("state_dict") or checkpoint.get("model_state_dict")
     if state_dict is None:
@@ -418,6 +472,46 @@ def sanitize_predictor(array: np.ndarray, fallback: float, label: str) -> np.nda
     return np.ascontiguousarray(np.where(finite, a, fill).astype(np.float32).ravel())
 
 
+def infer_dt_settings(
+    x_mean: np.ndarray, x_std: np.ndarray, window: int
+) -> Tuple[float, int]:
+    """
+    Reads the dt units and the longest training dt from the training scaler.
+    Returns (dt_per_month, max_dt_months). max_dt_months only limits the dt VALUE
+    given to the model; the search for real neighbours still spans `window`.
+    """
+    idx = (DT_PREV_INDEX, DT_NEXT_INDEX)
+    dt_mean = float(max(x_mean[i] for i in idx))
+    per_month = (
+        float(DT_PER_MONTH_OVERRIDE)
+        if DT_PER_MONTH_OVERRIDE
+        else (30.4 if dt_mean > 20.0 else 1.0)
+    )
+    hi = float(max(x_mean[i] + 2.0 * x_std[i] for i in idx))
+    cap = (
+        int(MAX_DT_MONTHS_OVERRIDE)
+        if MAX_DT_MONTHS_OVERRIDE
+        else max(1, int(round(hi / per_month)))
+    )
+    max_dt = int(max(1, cap))
+    print(
+        f"dt features: training mean {dt_mean:.2f} -> {'days' if per_month > 1.5 else 'months'} "
+        f"(x{per_month:g} per month); dt values are clamped to {max_dt} months "
+        f"(training range); real-neighbour search window stays {window} months."
+    )
+    return per_month, max_dt
+
+
+@torch.no_grad()
+def rbf_ood_distance(model: RBFN) -> float:
+    """Distance to the nearest RBF centre beyond which a pixel is out-of-distribution."""
+    c = model.centers.detach().float()
+    d = torch.cdist(c, c)
+    d.fill_diagonal_(float("inf"))
+    nn_spacing = d.min(dim=1).values
+    return float(OOD_FACTOR * torch.quantile(nn_spacing, 0.95))
+
+
 # ------------------------------------------------- per-pixel temporal context --
 def collect_temporal_context(
     store: SceneStore,
@@ -425,14 +519,21 @@ def collect_temporal_context(
     month: int,
     gap_idx: np.ndarray,
     window: int,
+    chain: Optional[np.ndarray] = None,
+    age: Optional[np.ndarray] = None,
+    dt_per_month: float = 1.0,
+    max_dt: Optional[int] = None,
 ) -> Dict[str, np.ndarray]:
     """
-    For every gap pixel, finds the nearest real previous and the nearest real
-    next observation within `window` months. Values, dt and availability are all
-    per pixel. Where nothing is found, bands stay zero, dt stays 0 and the flag
-    stays 0, exactly the convention used in training.
+    For every gap pixel, finds the nearest REAL previous and next observation
+    within `window` months. Where no real previous observation exists, the
+    previous month's gap-filled image (`chain`) is used instead, with dt equal to
+    the pixel's age in months (capped at `window`). Values, dt and availability
+    are all per pixel; where nothing is found, bands stay zero, dt stays 0 and
+    the flag stays 0, exactly the convention used in training.
     """
     n = gap_idx.size
+    dt_cap = int(max_dt) if max_dt is not None else int(window)
     ctx = {
         "prev_vals": np.zeros((n, N_BANDS), dtype=np.float32),
         "next_vals": np.zeros((n, N_BANDS), dtype=np.float32),
@@ -440,6 +541,7 @@ def collect_temporal_context(
         "next_dt": np.zeros(n, dtype=np.float32),
         "prev_ok": np.zeros(n, dtype=bool),
         "next_ok": np.zeros(n, dtype=bool),
+        "prev_filled": np.zeros(n, dtype=bool),
     }
 
     for k in range(1, window + 1):
@@ -457,10 +559,24 @@ def collect_temporal_context(
             sel = todo[good]
             if sel.size:
                 ctx[f"{direction}_vals"][sel] = vals[good]
-                ctx[f"{direction}_dt"][sel] = k * DT_PER_MONTH
+                ctx[f"{direction}_dt"][sel] = min(k, dt_cap) * dt_per_month
                 ok[sel] = True
         if ctx["prev_ok"].all() and ctx["next_ok"].all():
             break
+
+    # Chain: previous month's gap-filled image as the previous neighbour.
+    if USE_FILLED_AS_NEIGHBOUR and chain is not None:
+        need = np.flatnonzero(~ctx["prev_ok"])
+        if need.size:
+            vals = chain.reshape(N_BANDS, -1)[:, gap_idx[need]].T
+            good = np.all(np.isfinite(vals), axis=1)
+            sel = need[good]
+            if sel.size:
+                ages = age[gap_idx[sel]] if age is not None else window
+                ctx["prev_vals"][sel] = vals[good]
+                ctx["prev_dt"][sel] = np.minimum(ages + 1, dt_cap) * dt_per_month
+                ctx["prev_ok"][sel] = True
+                ctx["prev_filled"][sel] = True
     return ctx
 
 
@@ -477,13 +593,16 @@ def predict_gap_pixels(
     era5_temp: np.ndarray,
     dem_flat: np.ndarray,
     chunk_size: int,
-) -> np.ndarray:
-    """RBFN inference for gap_idx[sel], built and scaled chunk by chunk."""
+    ood_dist: float,
+) -> Tuple[np.ndarray, np.ndarray]:
+    """RBFN inference for gap_idx[sel], built and scaled chunk by chunk.
+    Returns (predictions, out_of_distribution flags)."""
     if chunk_size <= 0:
         raise ValueError("chunk_size must be greater than zero.")
 
     n = sel.size
     out = np.empty((n, EXPECTED_OUT_FEATURES), dtype=np.float32)
+    ood = np.zeros(n, dtype=bool)
 
     with torch.no_grad():
         for start in range(0, n, chunk_size):
@@ -503,10 +622,14 @@ def predict_gap_pixels(
             X[:, DEM_INDEX] = dem_flat[px]
 
             X_scaled = np.ascontiguousarray((X - x_mean) / x_std, dtype=np.float32)
-            pred_scaled = model(torch.from_numpy(X_scaled)).cpu().numpy()
+            phi = model.get_rbf_features(torch.from_numpy(X_scaled))
+            pred_scaled = model.readout(phi).cpu().numpy()
+            a_max = phi.max(dim=1).values.clamp_min(1e-30)
+            d_min = torch.sqrt(-torch.log(a_max) / model.gamma.clamp_min(1e-12))
+            ood[start:end] = (d_min > ood_dist).cpu().numpy()
             out[start:end] = pred_scaled * y_std + y_mean
 
-    return out
+    return out, ood
 
 
 # ----------------------------------------------------------- climatology --
@@ -582,6 +705,8 @@ class ClimatologyProvider:
         if self._month == month:
             return self._data
 
+        self._data = None
+        gc.collect()
         path = self.cache_dir / f"climatology_{month:02d}.tif"
         data = None
         if path.exists():
@@ -606,6 +731,94 @@ class ClimatologyProvider:
 
         self._month, self._data = month, data
         return data
+
+
+# ----------------------------------------------------------- texture guard --
+def local_std(band: np.ndarray, mask: np.ndarray, size: int) -> np.ndarray:
+    """Local standard deviation of `band` over `size` x `size` windows, using only
+    pixels where `mask` is True. NaN where fewer than 30 % of the window is valid."""
+    m = mask.astype(np.float32)
+    a = np.where(mask, band, 0.0).astype(np.float32)
+    n = uniform_filter(m, size, mode="constant")
+    s1 = uniform_filter(a, size, mode="constant")
+    s2 = uniform_filter(a * a, size, mode="constant")
+    safe = np.maximum(n, 1e-6)
+    mean = s1 / safe
+    var = np.maximum(s2 / safe - mean * mean, 0.0)
+    sd = np.sqrt(var).astype(np.float32)
+    sd[n < 0.3] = np.nan
+    return sd
+
+
+def detect_flat(
+    pred_c: np.ndarray,
+    ref_c: np.ndarray,
+    gap_idx: np.ndarray,
+    rb: np.ndarray,
+    shape: Tuple[int, int],
+    y_std: np.ndarray,
+) -> np.ndarray:
+    """
+    Returns a bool array (len gap_idx) marking RBFN pixels whose prediction has
+    lost its image texture: local std far below the reference's, or constant.
+    """
+    h, w = shape
+    n_total = h * w
+    rbm = np.zeros(n_total, dtype=bool)
+    rbm[gap_idx[rb]] = True
+    rbm2d = rbm.reshape(h, w)
+
+    flat2d = np.zeros((h, w), dtype=bool)
+    for b in TEXTURE_BANDS:
+        pg = np.full(n_total, np.nan, dtype=np.float32)
+        pg[gap_idx] = pred_c[:, b]
+        rg = np.full(n_total, np.nan, dtype=np.float32)
+        rg[gap_idx] = ref_c[:, b]
+        pg, rg = pg.reshape(h, w), rg.reshape(h, w)
+
+        ps = local_std(pg, rbm2d & np.isfinite(pg), TEXTURE_WINDOW)
+        rs = local_std(rg, rbm2d & np.isfinite(rg), TEXTURE_WINDOW)
+        floor = FLAT_ABS_SIGMAS * float(y_std[b])
+        is_flat = np.isfinite(ps) & (
+            (ps < floor) | (np.isfinite(rs) & (rs > floor) & (ps < FLAT_RATIO * rs))
+        )
+        flat2d |= is_flat
+        del pg, rg, ps, rs, is_flat
+
+    # Remove speckle: a pixel is flat if most of its neighbourhood is flat.
+    flat2d = (uniform_filter(flat2d.astype(np.float32), 15, mode="constant") > 0.5) & rbm2d
+    return flat2d.ravel()[gap_idx]
+
+
+def smooth_masked(
+    values: np.ndarray,
+    mask: np.ndarray,
+    sigma_px: float,
+    factor: int = OFFSET_DOWNSAMPLE,
+) -> np.ndarray:
+    """
+    Smooth regional field of `values` (2D) supported only where `mask` is True.
+    Computed on a block-averaged grid, then interpolated back. Far from any
+    support the field relaxes to the global mean, so there are no hard edges.
+    """
+    h, w = values.shape
+    hc, wc = -(-h // factor), -(-w // factor)
+    v = np.zeros((hc * factor, wc * factor), dtype=np.float32)
+    m = np.zeros_like(v)
+    v[:h, :w] = np.where(mask, values, 0.0)
+    m[:h, :w] = mask
+    v = v.reshape(hc, factor, wc, factor).sum(axis=(1, 3))
+    m = m.reshape(hc, factor, wc, factor).sum(axis=(1, 3))
+    if m.sum() <= 0:
+        return np.zeros((h, w), dtype=np.float32)
+    gmean = float(v.sum() / m.sum())
+    s = max(sigma_px / factor, 1.0)
+    vs = gaussian_filter(v, s, mode="constant")
+    ms = gaussian_filter(m, s, mode="constant")
+    lam = 0.1 * factor * factor
+    res = (vs + lam * gmean) / (ms + lam)
+    up = zoom(res, factor, order=1)
+    return up[:h, :w].astype(np.float32)
 
 
 # --------------------------------------------------------- spatial residual --
@@ -709,6 +922,29 @@ def write_raster(
             dst.write(output)
 
 
+def write_preview(
+    path: Path,
+    cube: np.ndarray,
+    aoi_mask: np.ndarray,
+    y_mean: np.ndarray,
+    y_std: np.ndarray,
+) -> None:
+    """Quick-look RGB (Red, Green, Blue = bands 0-2), fixed stretch across months."""
+    try:
+        from PIL import Image
+    except ImportError:
+        return
+    step = PREVIEW_STEP
+    rgb = cube[0:3, ::step, ::step]
+    top = (y_mean[:3] + 2.0 * y_std[:3]).reshape(3, 1, 1)
+    img = np.clip(rgb / top, 0.0, 1.0) ** 0.6
+    img = np.nan_to_num(img, nan=1.0)
+    arr = (np.moveaxis(img, 0, -1) * 255).astype(np.uint8)
+    arr[~aoi_mask[::step, ::step]] = 255
+    path.parent.mkdir(parents=True, exist_ok=True)
+    Image.fromarray(arr).save(path)
+
+
 # ------------------------------------------------------------- one month --
 def process_month(
     store: SceneStore,
@@ -728,18 +964,26 @@ def process_month(
     chunk_size: int,
     output_nodata: float,
     window: int,
+    dt_per_month: float,
+    max_dt_months: int,
+    ood_dist: float,
+    state: Dict,
     threshold_pct: float = 80.0,
 ) -> Dict:
+    """`state` carries the previous month's filled image ("chain") and per-pixel
+    age between calls, so months must be processed in chronological order."""
     tag = f"[{year}-{month:02d}]"
     height, width = aoi_mask.shape
+    n_total = height * width
     aoi_flat = aoi_mask.ravel()
     n_aoi = int(aoi_flat.sum())
 
     # 1. REAL OBSERVATIONS of the target month
     target = store.get(year, month)
-    obs_flat = np.zeros(aoi_flat.shape, dtype=bool)
-    if target is not None:
-        obs_flat = aoi_flat & np.all(np.isfinite(target.reshape(N_BANDS, -1)), axis=0)
+    tflat = target.reshape(N_BANDS, -1) if target is not None else None
+    obs_flat = np.zeros(n_total, dtype=bool)
+    if tflat is not None:
+        obs_flat = aoi_flat & np.all(np.isfinite(tflat), axis=0)
     coverage_pct = 100.0 * obs_flat.sum() / max(n_aoi, 1)
     print(f"{tag} real coverage {coverage_pct:.2f}% ({'scene found' if target is not None else 'no scene'})")
 
@@ -747,56 +991,149 @@ def process_month(
         print(f"{tag} coverage >= {threshold_pct}%, skipped by configuration.")
         return {"status": "SKIPPED"}
 
-    out = np.full((N_BANDS, height * width), np.nan, dtype=np.float32)
-    source = np.zeros(height * width, dtype=np.uint8)
+    chain = state.get("chain")
+    age_prev = state.get("age")
 
-    if target is not None and obs_flat.any():
-        out[:, obs_flat] = target.reshape(N_BANDS, -1)[:, obs_flat]
+    out = np.full((N_BANDS, n_total), np.nan, dtype=np.float32)
+    source = np.zeros(n_total, dtype=np.uint8)
+    if tflat is not None and obs_flat.any():
+        out[:, obs_flat] = tflat[:, obs_flat]
         source[obs_flat] = SRC_OBSERVED
 
     gap_idx = np.flatnonzero(aoi_flat & ~obs_flat)
+    n_gap = gap_idx.size
+    n_rbfn = n_guarded = n_clim = n_chain = n_chain_ctx = n_ood = 0
+    age_hint = None
 
-    # 2. RBFN where a real previous and/or next observation exists per pixel
-    n_rbfn = 0
-    if gap_idx.size:
-        ctx = collect_temporal_context(store, year, month, gap_idx, window)
-        has_ctx = ctx["prev_ok"] | ctx["next_ok"]
-        sel = np.flatnonzero(has_ctx)
+    if n_gap:
+        # 2. RBFN prediction with per-pixel (real or chained) neighbours
+        ctx = collect_temporal_context(
+            store, year, month, gap_idx, window, chain, age_prev, dt_per_month, max_dt_months
+        )
+        n_chain_ctx = int(ctx["prev_filled"].sum())
+        age_hint = np.where(
+            ctx["prev_ok"] & ~ctx["prev_filled"], ctx["prev_dt"] / dt_per_month, -1.0
+        ).astype(np.float32)
+
+        pred_c = np.full((n_gap, N_BANDS), np.nan, dtype=np.float32)
+        ood_c = np.zeros(n_gap, dtype=bool)
+        sel = np.flatnonzero(ctx["prev_ok"] | ctx["next_ok"])
         if sel.size:
-            era5_precip = sanitize_predictor(
-                processor.load_era5_predictor("precip", year, month),
-                x_mean[ERA5_PRECIP_INDEX], "ERA5 precip",
-            )
-            era5_temp = sanitize_predictor(
-                processor.load_era5_predictor("temp", year, month),
-                x_mean[ERA5_TEMP_INDEX], "ERA5 temp",
-            )
-            pred = predict_gap_pixels(
-                model, x_mean, x_std, y_mean, y_std,
-                gap_idx, sel, ctx, era5_precip, era5_temp, dem_flat, chunk_size,
-            )
-            finite = np.all(np.isfinite(pred), axis=1)
-            px = gap_idx[sel[finite]]
-            out[:, px] = pred[finite].T
-            source[px] = SRC_RBFN
-            n_rbfn = int(finite.sum())
-            del era5_precip, era5_temp, pred, finite, px
-        del ctx, has_ctx, sel
+            try:
+                era5_precip = sanitize_predictor(
+                    processor.load_era5_predictor("precip", year, month),
+                    x_mean[ERA5_PRECIP_INDEX], "ERA5 precip",
+                )
+                era5_temp = sanitize_predictor(
+                    processor.load_era5_predictor("temp", year, month),
+                    x_mean[ERA5_TEMP_INDEX], "ERA5 temp",
+                )
+                pred, ood = predict_gap_pixels(
+                    model, x_mean, x_std, y_mean, y_std,
+                    gap_idx, sel, ctx, era5_precip, era5_temp, dem_flat, chunk_size, ood_dist,
+                )
+                pred[~np.all(np.isfinite(pred), axis=1)] = np.nan
+                pred_c[sel] = pred
+                ood_c[sel] = ood
+                del era5_precip, era5_temp, pred, ood
+            except Exception as exc:
+                print(f"{tag} ! RBFN skipped ({exc}); reference image used instead.")
 
-    # 3. CLIMATOLOGY for pixels with no real observation inside the window
-    remaining = gap_idx[source[gap_idx] == SRC_NONE] if gap_idx.size else gap_idx
-    n_clim = 0
-    if remaining.size:
+        # 3. REFERENCE image with real texture: climatology > previous filled > neighbours
+        ref_c = np.full((n_gap, N_BANDS), np.nan, dtype=np.float32)
+        ref_src = np.zeros(n_gap, dtype=np.uint8)
+
         clim = climatology.get(month)
         if clim is not None:
-            vals = clim.reshape(N_BANDS, -1)[:, remaining].T
-            ok = np.all(np.isfinite(vals), axis=1)
-            out[:, remaining[ok]] = vals[ok].T
-            source[remaining[ok]] = SRC_CLIMATOLOGY
-            n_clim = int(ok.sum())
-            del vals, ok
+            v = clim.reshape(N_BANDS, -1)[:, gap_idx].T
+            ok = np.all(np.isfinite(v), axis=1)
+            ref_c[ok] = v[ok]
+            ref_src[ok] = SRC_CLIMATOLOGY
+            del v, ok
 
-    # 4. Range check, then SPATIAL fill of whatever is still empty
+        need = np.flatnonzero(ref_src == SRC_NONE)
+        if chain is not None and need.size:
+            v = chain.reshape(N_BANDS, -1)[:, gap_idx[need]].T
+            ok = np.all(np.isfinite(v), axis=1)
+            ref_c[need[ok]] = v[ok]
+            ref_src[need[ok]] = SRC_CHAIN
+            del v, ok
+
+        need = np.flatnonzero(ref_src == SRC_NONE)
+        if need.size:
+            pok = ctx["prev_ok"][need][:, None]
+            nok = ctx["next_ok"][need][:, None]
+            wsum = pok.astype(np.float32) + nok.astype(np.float32)
+            acc = ctx["prev_vals"][need] * pok + ctx["next_vals"][need] * nok
+            ok = wsum[:, 0] > 0
+            ref_c[need[ok]] = acc[ok] / wsum[ok]
+            ref_src[need[ok]] = SRC_CHAIN
+        del ctx
+
+        has_ref = np.isfinite(ref_c[:, 0])
+        pred_c[ood_c & ~has_ref] = np.nan  # out-of-distribution and nothing to anchor it
+        rb = np.isfinite(pred_c[:, 0])
+
+        # 4. GUARD: discard textureless predictions, bound the rest
+        final_c = ref_c.copy()
+        used = ref_src.copy()
+        if rb.any():
+            flat_c = np.zeros(n_gap, dtype=bool)
+            if has_ref.any():
+                flat_c = detect_flat(
+                    pred_c, ref_c, gap_idx, rb & has_ref, (height, width), y_std
+                )
+                flat_c |= ood_c
+            good = rb & has_ref & ~flat_c
+            guarded = rb & has_ref & flat_c
+            noref = rb & ~has_ref
+
+            for b in range(N_BANDS):
+                bound = MAX_ANOMALY_SIGMAS * float(y_std[b])
+                r = ref_c[:, b]
+                p = pred_c[:, b]
+
+                # Regional offset: this month's real anomaly vs climatology, plus healthy RBFN pixels.
+                off = None
+                if guarded.any():
+                    dgrid = np.full(n_total, np.nan, dtype=np.float32)
+                    if clim is not None and tflat is not None and obs_flat.any():
+                        cb = clim[b].ravel()
+                        tb = tflat[b]
+                        s = obs_flat & np.isfinite(cb) & np.isfinite(tb)
+                        dgrid[s] = tb[s] - cb[s]
+                    dgrid[gap_idx[good]] = p[good] - r[good]
+                    dm = np.isfinite(dgrid)
+                    if dm.any():
+                        off = smooth_masked(
+                            np.nan_to_num(dgrid).reshape(height, width),
+                            dm.reshape(height, width),
+                            OFFSET_SIGMA_PX,
+                        ).ravel()[gap_idx]
+                    del dgrid, dm
+                if off is None:
+                    off = np.zeros(n_gap, dtype=np.float32)
+
+                final_c[good, b] = r[good] + np.clip(p[good] - r[good], -bound, bound)
+                final_c[guarded, b] = r[guarded] + np.clip(off[guarded], -bound, bound)
+                final_c[noref, b] = p[noref]
+
+            used[good] = SRC_RBFN
+            used[guarded] = SRC_GUARDED
+            used[noref] = SRC_RBFN
+            n_rbfn = int(good.sum() + noref.sum())
+            n_guarded = int(guarded.sum())
+            n_ood = int((ood_c & rb).sum())
+
+        n_clim = int((used == SRC_CLIMATOLOGY).sum())
+        n_chain = int((used == SRC_CHAIN).sum())
+
+        out[:, gap_idx] = final_c.T
+        source[gap_idx] = used
+        del pred_c, ref_c, final_c, ref_src, used, has_ref, rb
+        gc.collect()
+
+    # 5. Range check, then SPATIAL fill of whatever is still empty
     cube = out.reshape(N_BANDS, height, width)
     lo, hi = store.lo, store.hi
     np.clip(cube, lo[:, None, None], hi[:, None, None], out=cube)
@@ -807,45 +1144,77 @@ def process_month(
     np.clip(cube, lo[:, None, None], hi[:, None, None], out=cube)
     cube[:, ~aoi_mask] = np.nan
 
-    # 5. Write
-    ndvi = derive_ndvi(cube)
+    # 6. QA: share of the filled area that is still textureless
+    gap_mask2d = (aoi_flat & ~obs_flat).reshape(height, width) & np.isfinite(cube[NIR_INDEX])
+    qa_flat_pct = 0.0
+    if gap_mask2d.any():
+        sd = local_std(cube[NIR_INDEX], gap_mask2d, TEXTURE_WINDOW)
+        okpix = gap_mask2d & np.isfinite(sd)
+        if okpix.any():
+            qa_flat_pct = float(
+                100.0 * np.mean(sd[okpix] < FLAT_ABS_SIGMAS * float(y_std[NIR_INDEX]))
+            )
+        del sd, okpix
+    del gap_mask2d
 
+    # 7. Write
+    ndvi = derive_ndvi(cube)
     band_path = output_dir / f"landsat_{year}_{month:02d}_rbfn_gapfilled.tif"
     ndvi_path = output_dir / f"ndvi_{year}_{month:02d}_rbfn_gapfilled.tif"
     prov_path = output_dir / "provenance" / f"landsat_{year}_{month:02d}_source.tif"
-
     write_raster(band_path, cube, target_profile, output_nodata)
     write_raster(ndvi_path, ndvi, target_profile, output_nodata)
     write_raster(prov_path, source2d, target_profile, 0, dtype="uint8")
+    if WRITE_PREVIEWS:
+        write_preview(output_dir / "preview" / f"landsat_{year}_{month:02d}.png", cube, aoi_mask, y_mean, y_std)
 
     final_valid = aoi_mask & np.all(np.isfinite(cube), axis=0)
     final_pct = 100.0 * final_valid.sum() / max(n_aoi, 1)
     n_obs = int((source == SRC_OBSERVED).sum())
 
     print(
-        f"{tag} observed {n_obs:,} | RBFN {n_rbfn:,} | climatology {n_clim:,} | "
-        f"spatial {n_spatial:,} | final coverage {final_pct:.2f}%"
+        f"{tag} observed {n_obs:,} | RBFN {n_rbfn:,} | RBFN guarded {n_guarded:,} (out-of-distribution {n_ood:,}) | "
+        f"climatology {n_clim:,} | previous-filled/neighbour {n_chain:,} | spatial {n_spatial:,} | "
+        f"chain used as neighbour {n_chain_ctx:,}"
     )
-    red_mean = float(np.nanmean(cube[RED_INDEX][final_valid])) if final_valid.any() else float("nan")
-    blue_mean = float(np.nanmean(cube[2][final_valid])) if final_valid.any() else float("nan")
-    print(f"{tag} sanity -> Red {red_mean:.4f} | Blue {blue_mean:.4f}")
+    print(f"{tag} final coverage {final_pct:.2f}% | flat-block QA {qa_flat_pct:.2f}%")
+    if qa_flat_pct > 5.0:
+        print(f"{tag} ! WARNING: {qa_flat_pct:.1f}% of the filled area is still textureless. Inspect this month.")
+
+    # 8. Update chain state for the next month
+    if age_prev is None:
+        age_new = np.full(n_total, window, dtype=np.int16)
+    else:
+        age_new = np.minimum(age_prev + 1, window).astype(np.int16)
+    if age_hint is not None:
+        has_real_prev = age_hint >= 0
+        age_new[gap_idx[has_real_prev]] = np.minimum(age_hint[has_real_prev], window).astype(np.int16)
+    age_new[(source == SRC_CLIMATOLOGY) | (source == SRC_SPATIAL)] = window
+    age_new[obs_flat] = 0
+    state["chain"] = cube
+    state["age"] = age_new
 
     def pct(v: int) -> float:
         return round(100.0 * v / max(n_aoi, 1), 3)
 
-    del out, cube, ndvi, source, source2d, target
+    del out, ndvi, source, source2d
     gc.collect()
 
     return {
-        "status": "COMPLETE" if final_pct >= 99.9 else "PARTIAL",
+        "status": "COMPLETE" if (final_pct >= 99.9 and qa_flat_pct <= 5.0) else "CHECK",
         "year": year,
         "month": month,
         "total_aoi_pixels": n_aoi,
         "observed_pct": pct(n_obs),
         "rbfn_pct": pct(n_rbfn),
+        "rbfn_guarded_pct": pct(n_guarded),
+        "ood_pct": pct(n_ood),
         "climatology_pct": pct(n_clim),
+        "prev_filled_or_neighbour_pct": pct(n_chain),
         "spatial_pct": pct(n_spatial),
-        "final_coverage_pct": round(final_pct, 3),
+        "chain_context_pct": pct(n_chain_ctx),
+        "flat_block_qa_pct": round(qa_flat_pct, 3),
+        "final_coverage_pct": round(float(final_pct), 3),
     }
 
 
@@ -874,6 +1243,12 @@ def main() -> None:
     chunk_size = int(config["model"]["rbfn"]["chunk_size"])
     output_nodata = float(config["gap_filling"]["output_nodata"])
     window = int(config["gap_filling"].get("search_window_months", SEARCH_WINDOW_MONTHS))
+    dt_per_month, max_dt_months = infer_dt_settings(x_mean, x_std, window)
+    ood_dist = rbf_ood_distance(model)
+    print(
+        f"RBFN: {model.num_centers} centres, gamma {float(model.gamma):.5f}; "
+        f"out-of-distribution distance {ood_dist:.3f} (scaled units)."
+    )
     output_dir = root_dir / config["paths"]["gapfilled_dir"]
     output_dir.mkdir(parents=True, exist_ok=True)
 
@@ -890,14 +1265,26 @@ def main() -> None:
         cache_dir=root_dir / config["paths"]["processed_dir"] / "climatology",
     )
 
-    rows = []
-    total_complete = 0
-    total_partial = 0
-    total_failed = 0
-    total_skipped = 0
+    # Optional date range from the command line: START END as YYYY-MM.
+    span = [a for a in sys.argv[1:] if re.fullmatch(r"\d{4}-\d{1,2}", a)]
+    start_key, end_key = (int(gap_start), 1), (int(gap_end), 12)
+    if len(span) >= 1:
+        y, m = map(int, span[0].split("-"))
+        start_key = (y, m)
+        end_key = (y, m)
+    if len(span) >= 2:
+        y, m = map(int, span[1].split("-"))
+        end_key = (y, m)
+    print(f"Processing {start_key[0]}-{start_key[1]:02d} -> {end_key[0]}-{end_key[1]:02d}")
 
-    for year in range(int(gap_start), int(gap_end) + 1):
+    state: Dict = {"chain": None, "age": None}
+    rows = []
+    counts = {"COMPLETE": 0, "CHECK": 0, "SKIPPED": 0, "FAILED": 0}
+
+    for year in range(start_key[0], end_key[0] + 1):
         for month in range(1, 13):
+            if not (start_key <= (year, month) <= end_key):
+                continue
             print(f"Processing gap month: {year}-{month:02d}")
             try:
                 result = process_month(
@@ -918,21 +1305,17 @@ def main() -> None:
                     chunk_size=chunk_size,
                     output_nodata=output_nodata,
                     window=window,
+                    dt_per_month=dt_per_month,
+                    max_dt_months=max_dt_months,
+                    ood_dist=ood_dist,
+                    state=state,
                 )
             except Exception as exc:
                 traceback.print_exc()
                 result = {"status": f"FAILED: {exc}", "year": year, "month": month}
 
             status = result["status"]
-            if status == "COMPLETE":
-                total_complete += 1
-            elif status == "PARTIAL":
-                total_partial += 1
-            elif status == "SKIPPED":
-                total_skipped += 1
-            else:
-                total_failed += 1
-
+            counts[status if status in counts else "FAILED"] += 1
             if status != "SKIPPED":
                 rows.append(result)
             gc.collect()
@@ -940,7 +1323,9 @@ def main() -> None:
     summary_path = output_dir / "gapfill_run_summary.csv"
     fields = [
         "year", "month", "total_aoi_pixels", "observed_pct", "rbfn_pct",
-        "climatology_pct", "spatial_pct", "final_coverage_pct", "status",
+        "rbfn_guarded_pct", "ood_pct", "climatology_pct", "prev_filled_or_neighbour_pct",
+        "spatial_pct", "chain_context_pct", "flat_block_qa_pct",
+        "final_coverage_pct", "status",
     ]
     with summary_path.open("w", newline="", encoding="utf-8") as fh:
         writer = csv.DictWriter(fh, fieldnames=fields, extrasaction="ignore")
@@ -948,10 +1333,10 @@ def main() -> None:
         writer.writerows(rows)
 
     print("Gap-filling inference completed.")
-    print(f"Months complete (>= 99.9% of AOI): {total_complete}")
-    print(f"Months partial: {total_partial}")
-    print(f"Months failed: {total_failed}")
-    print(f"Months skipped: {total_skipped}")
+    print(f"Months complete: {counts['COMPLETE']}")
+    print(f"Months to inspect (CHECK): {counts['CHECK']}")
+    print(f"Months failed: {counts['FAILED']}")
+    print(f"Months skipped: {counts['SKIPPED']}")
     print(f"Run summary: {summary_path}")
 
 
