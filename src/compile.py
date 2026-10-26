@@ -3,14 +3,13 @@
 """
 Compilation Pipeline for Unified Landsat Time-Series (1995–2025).
 
-Assembles a complete, continuous dataset into `outputs/compiled/` by:
-1. Evaluating AOI catchment coverage for each target month (1995–2025).
-2. Sourcing clean raw scenes (>= 80% AOI coverage) from `data/landsat/`
-   and naming them with `_R.tif` (e.g. landsat_1995_01_l5_R.tif).
-3. Sourcing gap-filled reconstructions (< 80% AOI coverage) from `outputs/gapfilled/`
-   and naming them as `landsat_YYYY_MM_GP.tif`.
-4. Enforcing unified Model Config Band Order [Red, Green, Blue, NIR, SWIR1, SWIR2, Thermal].
-5. Selectively applying SLC-off median filtering ONLY to raw Landsat 7 scenes needing patching.
+Assembles a complete dataset into `outputs/compiled/` by:
+1. Sourcing 100% complete rasters directly from `outputs/gapfilled/` first,
+   retaining their exact `_R.tif` or `_GP.tif` filenames.
+2. Sourcing raw scenes from `data/landsat/` ONLY as a fallback if missing in gapfilled,
+   applying SLC-off median filtering if needed, and tagging them as `_R.tif`.
+3. Enforcing unified Model Config Band Order [Red, Green, Blue, NIR, SWIR1, SWIR2, Thermal].
+4. Masking AOI catchment boundaries strictly.
 """
 
 import gc
@@ -24,7 +23,6 @@ from rasterio.features import rasterize
 from rasterio.warp import Resampling, reproject
 from scipy.ndimage import median_filter
 
-# Workspace directory setup
 ROOT_DIR = Path(__file__).resolve().parents[1]
 RAW_DIR = ROOT_DIR / "data" / "landsat"
 GAPFILLED_DIR = ROOT_DIR / "outputs" / "gapfilled"
@@ -88,10 +86,10 @@ def fill_slc_off_scanlines(raster_cube: np.ndarray) -> np.ndarray:
     return cleaned
 
 
-def load_and_align_raw_scene(tif_path: Path, target_profile: dict) -> np.ndarray:
+def load_and_align_scene(tif_path: Path, target_profile: dict, is_raw: bool = False) -> np.ndarray:
     """
-    Loads a raw scene from data/landsat/, reprojects it to target_profile,
-    scales reflectance if needed, and re-arranges bands to Model RGB order.
+    Loads and reprojects a raster to target_profile.
+    Re-orders GEE bands if loading raw imagery.
     """
     with rasterio.open(tif_path) as src:
         out_h = target_profile["height"]
@@ -112,47 +110,22 @@ def load_and_align_raw_scene(tif_path: Path, target_profile: dict) -> np.ndarray
                 resampling=Resampling.nearest,
             )
 
-        # Scale check: divide integer reflectance scale (0-10000) if needed
         if np.nanmedian(destination[destination > 0]) > 1.0:
             destination = destination / 10000.0
 
         destination = np.clip(destination, 0.0, 1.0)
-        destination = reorder_gee_to_config_bands(destination)
+        
+        if is_raw:
+            destination = reorder_gee_to_config_bands(destination)
 
         return destination
 
 
-def load_and_align_gapfilled_scene(tif_path: Path, target_profile: dict) -> np.ndarray:
-    """
-    Loads and reprojects a gap-filled raster to match target_profile dimensions exactly.
-    """
-    with rasterio.open(tif_path) as src:
-        out_h = target_profile["height"]
-        out_w = target_profile["width"]
-        out_crs = target_profile["crs"]
-        out_transform = target_profile["transform"]
-
-        destination = np.zeros((src.count, out_h, out_w), dtype=np.float32)
-
-        for band_idx in range(1, src.count + 1):
-            reproject(
-                source=rasterio.band(src, band_idx),
-                destination=destination[band_idx - 1],
-                src_transform=src.transform,
-                src_crs=src.crs,
-                dst_transform=out_transform,
-                dst_crs=out_crs,
-                resampling=Resampling.nearest,
-            )
-
-        if np.nanmedian(destination[destination > 0]) > 1.0:
-            destination = destination / 10000.0
-
-        return np.clip(destination, 0.0, 1.0)
-
-
 def find_scene_path(search_dir: Path, year: int, month: int, exclude_pattern: str = "NDVI") -> Path:
     """Locates scene file matching year and month in target folder."""
+    if not search_dir.exists():
+        return None
+
     p1 = f"_{year}_{month:02d}"
     p2 = f"_{year}_{month}"
 
@@ -166,10 +139,10 @@ def find_scene_path(search_dir: Path, year: int, month: int, exclude_pattern: st
 
 
 def get_reference_profile() -> Dict:
-    """Extracts reference spatial profile from any available raw file."""
-    tif_files = list(RAW_DIR.glob("*.tif")) + list(RAW_DIR.glob("*.tiff"))
+    """Extracts reference spatial profile from any available raster."""
+    tif_files = list(GAPFILLED_DIR.glob("landsat_*.tif")) or list(RAW_DIR.glob("*.tif"))
     if not tif_files:
-        raise FileNotFoundError(f"No reference GeoTIFF files found in {RAW_DIR}")
+        raise FileNotFoundError("No reference GeoTIFF files found in gapfilled or raw directories.")
 
     with rasterio.open(tif_files[0]) as src:
         profile = src.profile.copy()
@@ -203,62 +176,48 @@ def process_month_compilation(
     month: int,
     target_profile: Dict,
     aoi_mask: np.ndarray,
-    threshold_pct: float = 80.0,
 ) -> Tuple[str, str, float]:
     """
-    Compiles a single target month and returns (source_type, compiled_filename, coverage_pct).
+    Compiles a single target month:
+    1. Checks outputs/gapfilled/ first.
+    2. Falls back to data/landsat/ if missing in gapfilled.
     """
-    raw_path = find_scene_path(RAW_DIR, year, month, exclude_pattern=None)
     gapfilled_path = find_scene_path(GAPFILLED_DIR, year, month, exclude_pattern="NDVI")
+    raw_path = find_scene_path(RAW_DIR, year, month, exclude_pattern=None)
 
     selected_data = None
     compiled_filename = None
     source_type = None
-    coverage_pct = 0.0
 
-    # 1. EVALUATE RAW SCENE COVERAGE FIRST
-    if raw_path is not None:
-        raw_cube = load_and_align_raw_scene(raw_path, target_profile)
-        valid_pixels = np.all(np.isfinite(raw_cube) & (raw_cube > 0.0001), axis=0) & aoi_mask
-        total_aoi_pixels = np.sum(aoi_mask)
-        coverage_pct = (np.sum(valid_pixels) / max(total_aoi_pixels, 1)) * 100.0
+    # 1. PRIORITY 1: GAPFILLED DIRECTORY (Includes both _R and _GP processed scenes)
+    if gapfilled_path is not None:
+        selected_data = load_and_align_scene(gapfilled_path, target_profile, is_raw=False)
+        compiled_filename = gapfilled_path.name
+        source_type = "GAPFILLED_" + ("R" if "_R" in gapfilled_path.stem else "GP")
 
-        if coverage_pct >= threshold_pct:
-            selected_data = raw_cube
-            source_type = "RAW"
-            
-            # Apply SLC scanline filtering ONLY to raw scenes during L7 window (2003-2022)
-            if 2003 <= year <= 2022 and "l7" in raw_path.stem.lower():
-                selected_data = fill_slc_off_scanlines(selected_data)
+    # 2. PRIORITY 2: RAW LANDSAT FALLBACK (If gapfilled is missing)
+    elif raw_path is not None:
+        selected_data = load_and_align_scene(raw_path, target_profile, is_raw=True)
+        source_type = "RAW_FALLBACK"
 
-            # Preserve original filename stem and append _R.tif
-            compiled_filename = f"{raw_path.stem}_R.tif"
+        if 2003 <= year <= 2022 and "l7" in raw_path.stem.lower():
+            selected_data = fill_slc_off_scanlines(selected_data)
 
-    # 2. FALLBACK TO GAPFILLED SCENE IF RAW IS MISSING OR < 80% COVERAGE
-    if selected_data is None:
-        if gapfilled_path is not None:
-            gap_cube = load_and_align_gapfilled_scene(gapfilled_path, target_profile)
-            selected_data = gap_cube
-            source_type = "GAPFILLED"
-            
-            # Gap-filled naming convention: landsat_YYYY_MM_GP.tif
-            compiled_filename = f"landsat_{year}_{month:02d}_GP.tif"
-
-        elif raw_path is not None:
-            # Fallback to raw if gapfilled file is missing
-            selected_data = raw_cube
-            source_type = "RAW_FALLBACK"
-            if 2003 <= year <= 2022 and "l7" in raw_path.stem.lower():
-                selected_data = fill_slc_off_scanlines(selected_data)
+        if "_R" in raw_path.stem:
+            compiled_filename = raw_path.name
+        else:
             compiled_filename = f"{raw_path.stem}_R.tif"
 
     if selected_data is None:
         return "MISSING", "", 0.0
 
-    # 3. MASK OUT NON-AOI BACKGROUND CELLS
+    # Mask non-AOI cells
     selected_data[:, ~aoi_mask] = np.nan
 
-    # 4. SAVE TO COMPILED FOLDER
+    # Calculate AOI coverage
+    valid_pixels = np.all(np.isfinite(selected_data) & (selected_data > 0.0001), axis=0) & aoi_mask
+    coverage_pct = (np.sum(valid_pixels) / max(np.sum(aoi_mask), 1)) * 100.0
+
     out_path = COMPILED_DIR / compiled_filename
     write_compiled_raster(out_path, selected_data, target_profile)
 
@@ -268,6 +227,7 @@ def process_month_compilation(
 def main() -> None:
     print("=========================================================")
     print(" Starting Landsat Dataset Compilation (1995 - 2025)...")
+    print(" Priority: outputs/gapfilled/ -> data/landsat/")
     print(" Output Folder: outputs/compiled/")
     print("=========================================================\n")
 
@@ -284,14 +244,13 @@ def main() -> None:
                 month=month,
                 target_profile=target_profile,
                 aoi_mask=aoi_mask,
-                threshold_pct=80.0,
             )
 
             if source_type != "MISSING":
-                print(f"[{year}-{month:02d}] Compiled -> {out_filename:<30} | Source: {source_type:<12} | AOI Coverage: {cov_pct:.2f}%")
+                print(f"[{year}-{month:02d}] Compiled -> {out_filename:<32} | Source: {source_type:<15} | AOI Coverage: {cov_pct:.2f}%")
                 total_compiled += 1
             else:
-                print(f"[{year}-{month:02d}] WARNING: No scene found in raw or gapfilled folders.")
+                print(f"[{year}-{month:02d}] WARNING: No scene found in gapfilled or raw folders.")
                 total_missing += 1
 
             gc.collect()
