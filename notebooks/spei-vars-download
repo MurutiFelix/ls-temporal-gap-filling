@@ -8,7 +8,7 @@ era5land_precip_YYYY_MM. The export rectangle is the bounding box of the importe
 aoi table plus a 15 km buffer, so cells along the AOI edge keep their values.
 */
 
-var START_YEAR = 1995;  // 1981 gives a longer SPEI calibration record
+var START_YEAR = 1981;  // 1981 gives a longer SPEI calibration record
 var END_YEAR = 2025;
 
 var region = aoi.geometry().buffer(15000).bounds();  // aoi = imported table
