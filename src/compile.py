@@ -13,6 +13,7 @@ Assembles a complete dataset into `outputs/compiled/` by:
 """
 
 import gc
+import re
 from pathlib import Path
 from typing import Dict, Tuple
 
@@ -122,18 +123,18 @@ def load_and_align_scene(tif_path: Path, target_profile: dict, is_raw: bool = Fa
 
 
 def find_scene_path(search_dir: Path, year: int, month: int, exclude_pattern: str = "NDVI") -> Path:
-    """Locates scene file matching year and month in target folder."""
+    """Locates scene file matching year and month exactly in target folder."""
     if not search_dir.exists():
         return None
 
-    p1 = f"_{year}_{month:02d}"
-    p2 = f"_{year}_{month}"
+    # Fix: Exact month matching using negative lookahead to prevent _1 matching _10, _11, or _12
+    pattern = re.compile(rf"_{year}_0?{month}(?!\d)", re.IGNORECASE)
 
-    tif_files = list(search_dir.glob("*.tif")) + list(search_dir.glob("*.tiff"))
+    tif_files = sorted(list(search_dir.glob("*.tif")) + list(search_dir.glob("*.tiff")))
     for f in tif_files:
         if exclude_pattern and exclude_pattern.lower() in f.stem.lower():
             continue
-        if p1 in f.stem or p2 in f.stem:
+        if pattern.search(f.stem):
             return f
     return None
 
