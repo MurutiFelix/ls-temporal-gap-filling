@@ -91,6 +91,8 @@ def load_and_align_scene(tif_path: Path, target_profile: dict, is_raw: bool = Fa
     """
     Loads and reprojects a raster to target_profile.
     Re-orders GEE bands if loading raw imagery.
+    Bands 1-6 are reflectance (scaled to 0-1 and clipped); band 7 is thermal in Kelvin
+    and is never scaled or clipped.
     """
     with rasterio.open(tif_path) as src:
         out_h = target_profile["height"]
@@ -111,11 +113,15 @@ def load_and_align_scene(tif_path: Path, target_profile: dict, is_raw: bool = Fa
                 resampling=Resampling.nearest,
             )
 
-        if np.nanmedian(destination[destination > 0]) > 1.0:
-            destination = destination / 10000.0
+        destination[destination <= -9000] = np.nan  # nodata written as -9999 upstream
 
-        destination = np.clip(destination, 0.0, 1.0)
-        
+        refl = destination[:6]  # bands 1-6; band 7 is thermal in Kelvin
+        positive = refl[refl > 0]
+        if positive.size and np.nanmedian(positive) > 1.0:
+            refl /= 10000.0  # integer-scaled reflectance
+        np.clip(refl, 0.0, 1.0, out=refl)
+        destination[6][destination[6] <= 0] = np.nan  # Kelvin is positive, so 0 means no data
+
         if is_raw:
             destination = reorder_gee_to_config_bands(destination)
 
