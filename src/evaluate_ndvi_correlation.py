@@ -104,7 +104,7 @@ def evaluate_ndvi_pair(
         ref_raw = src_ref.read(1).astype(np.float32)
         if src_ref.nodata is not None:
             ref_raw[ref_raw == src_ref.nodata] = np.nan
-        ref_raw[(ref_raw <= -9000) | (ref_raw == 0)] = np.nan  # fill values and masked zeros
+        ref_raw[(ref_raw <= -9000) | (ref_raw == 0)] = np.nan  # Fill values and masked zeros
 
         positive = ref_raw[ref_raw > 0]
         if positive.size and np.nanmedian(positive) > 1.0:
@@ -122,6 +122,61 @@ def evaluate_ndvi_pair(
             dst_nodata=np.nan,
             resampling=Resampling.bilinear,
         )
+
+    # Valid mask: STRICTLY INSIDE AOI + Finite Valid Values
+    valid = (
+        aoi_mask
+        & np.isfinite(ls_ndvi)
+        & np.isfinite(ref_resampled)
+        & (ls_ndvi >= -1.0) & (ls_ndvi <= 1.0)
+        & (ref_resampled >= -1.0) & (ref_resampled <= 1.0)
+    )
+
+    if np.sum(valid) < 100:
+        return None
+
+    ls_v = ls_ndvi[valid]
+    ref_v = ref_resampled[valid]
+
+    std_ls = np.std(ls_v)
+    std_ref = np.std(ref_v)
+
+    if std_ls < 1e-6 or std_ref < 1e-6:
+        r_val = np.nan
+    else:
+        r_val, _ = pearsonr(ls_v, ref_v)
+        r_val = float(r_val)
+
+    rmse_val = float(np.sqrt(np.mean((ls_v - ref_v) ** 2)))
+
+    # Crop arrays to tight bounding box of catchment mask to eliminate background SSIM inflation
+    rows, cols = np.where(valid)
+    min_r, max_r = rows.min(), rows.max()
+    min_c, max_c = cols.min(), cols.max()
+
+    ls_crop = ls_ndvi[min_r : max_r + 1, min_c : max_c + 1]
+    ref_crop = ref_resampled[min_r : max_r + 1, min_c : max_c + 1]
+    valid_crop = valid[min_r : max_r + 1, min_c : max_c + 1]
+
+    ls_2d = np.where(valid_crop, ls_crop, np.nanmedian(ls_v))
+    ref_2d = np.where(valid_crop, ref_crop, np.nanmedian(ref_v))
+    ssim_val = float(ssim(ls_2d, ref_2d, data_range=2.0))
+
+    match = re.search(r"_(\d{4})_(\d{1,2})", landsat_path.stem)
+    year = int(match.group(1)) if match else None
+    month = int(match.group(2)) if match else None
+
+    return {
+        "year": year,
+        "month": month,
+        "landsat_file": landsat_path.name,
+        "reference_sensor": sensor_name,
+        "scene_type": scene_type,
+        "pearson_r": r_val,
+        "rmse": rmse_val,
+        "ssim": ssim_val,
+        "valid_pixel_count": int(np.sum(valid)),
+    }
 
 
 def build_reference_map(directory: Path, prefix: str) -> dict:
