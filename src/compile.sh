@@ -1,9 +1,10 @@
 #!/bin/bash
 #SBATCH --job-name=compile_thermal
-#SBATCH --partition=normal
+#SBATCH --partition=gpu1
+#SBATCH --exclude=hpc-icolo-11
 #SBATCH --nodes=1
 #SBATCH --ntasks-per-node=1
-#SBATCH --cpus-per-task=4
+#SBATCH --cpus-per-task=16
 #SBATCH --mem=300000
 #SBATCH --gres=gpu:1
 #SBATCH --time=1-00:00:00

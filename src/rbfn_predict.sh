@@ -1,5 +1,6 @@
 #!/bin/bash
 #SBATCH --job-name=rbfn_tr1
+#SBATCH --exclude=hpc-icolo-11
 #SBATCH --partition=gpu1
 #SBATCH --nodes=1
 #SBATCH --ntasks-per-node=1
