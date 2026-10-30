@@ -1,19 +1,19 @@
 #!/bin/bash
-#SBATCH --job-name=rbfn_compile
-#SBATCH --partition=gpu1
+#SBATCH --job-name=compile_thermal
+#SBATCH --partition=normal
 #SBATCH --nodes=1
 #SBATCH --ntasks-per-node=1
-#SBATCH --cpus-per-task=16
+#SBATCH --cpus-per-task=4
 #SBATCH --mem=300000
 #SBATCH --gres=gpu:1
 #SBATCH --time=1-00:00:00
-#SBATCH --output=logs/rbfn_compile_%j.out
-#SBATCH --error=logs/rbfn_compile_%j.err
+#SBATCH --output=/scratch/lustre/users/fngari/ls-temporal-gap-filling/logs/%x_%j.out
+#SBATCH --error=/scratch/lustre/users/fngari/ls-temporal-gap-filling/logs/%x_%j.err
 
 # --- Working Directory Setup ---
-cd /scratch/lustre/users/$USER/ls-temporal-gap-filling
-mkdir -p logs
-export PYTHONPATH="${PYTHONPATH}:${SLURM_SUBMIT_DIR}"
+PROJECT_DIR=/scratch/lustre/users/fngari/ls-temporal-gap-filling
+cd "$PROJECT_DIR"
+export PYTHONPATH="${PYTHONPATH}:${PROJECT_DIR}"
 
 # --- Environment Setup ---
 module purge
