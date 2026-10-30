@@ -31,7 +31,7 @@ landsat:
     - "Thermal"
   data_years: [1995, 2025]
   training_years: [2000, 2025]
-  gap_years: [1995, 2024]
+  gap_years: [1995, 2025]
 
 features:
   inputs:
